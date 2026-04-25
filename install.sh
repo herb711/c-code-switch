@@ -97,6 +97,42 @@ backup_if_exists() {
   fi
 }
 
+install_npm_if_needed() {
+  if need_cmd npm; then
+    return
+  fi
+
+  if ! need_cmd curl; then
+    die "curl is not installed. Install curl first, then rerun this script."
+  fi
+
+  say "npm not found. Installing Node.js via fnm (no sudo required)..."
+
+  local fnm_dir="${HOME}/.fnm"
+  local fnm_bin="${fnm_dir}/fnm"
+  local fnm_url
+  fnm_url="$(curl -fsSL https://api.github.com/repos/Schniz/fnm/releases/latest | grep 'browser_download_url.*linux-x64"' | cut -d'"' -f4)"
+
+  if [ -z "$fnm_url" ]; then
+    die "Failed to find fnm release URL. Install Node.js manually, then rerun."
+  fi
+
+  mkdir -p "${fnm_dir}"
+  curl -fsSL "$fnm_url" -o "$fnm_bin"
+  chmod +x "$fnm_bin"
+
+  export PATH="${fnm_dir}:${PATH}"
+  eval "$(fnm env --use-on-cd)"
+  fnm install 20
+  fnm default 20
+
+  if ! need_cmd npm; then
+    die "fnm installed but npm still not found. Check PATH after: eval \"\$(fnm env --use-on-cd)\""
+  fi
+
+  say "Node.js and npm installed: $(node --version) / $(npm --version)"
+}
+
 install_claude_code() {
   if need_cmd claude; then
     say "Claude Code already installed: $(command -v claude)"
@@ -104,9 +140,7 @@ install_claude_code() {
     return
   fi
 
-  if ! need_cmd npm; then
-    die "npm is not installed. Install Node.js/npm first, then rerun this script."
-  fi
+  install_npm_if_needed
 
   say "Installing Claude Code with npm..."
   npm install -g @anthropic-ai/claude-code
@@ -279,7 +313,6 @@ EOF_SERVICE
 
 main() {
   say "Codalane: Claude Code + MiniMax headless installer"
-  say "This script does not use any existing API key. You will enter your own key."
   say
 
   install_claude_code

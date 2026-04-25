@@ -8,6 +8,8 @@ This project is not affiliated with Anthropic, MiniMax, or CC Switch.
 
 ## Install
 
+Requirements: `curl`. Node.js and npm are installed automatically if missing.
+
 Review the script before running it:
 
 ```bash
@@ -25,6 +27,7 @@ curl -fsSL https://raw.githubusercontent.com/herb711/c-code-switch/main/install.
 ## What It Does
 
 - Installs Claude Code with `npm install -g @anthropic-ai/claude-code` if `claude` is not already installed.
+- If `npm` is not found, automatically installs Node.js via [fnm](https://github.com/Schniz/fnm) (no sudo required).
 - Lets the user choose the MiniMax endpoint:
   - China mainland: `https://api.minimaxi.com/anthropic`
   - International: `https://api.minimax.io/anthropic`
