@@ -1,22 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_NAME="codalane"
+APP_NAME="agent-router"
 CLAUDE_DIR="${HOME}/.claude"
 SETTINGS_FILE="${CLAUDE_DIR}/settings.json"
-PROXY_DIR="${HOME}/.local/share/ccswitch-proxy"
+PROXY_DIR="${HOME}/.local/share/agent-router-proxy"
 PROXY_BIN="${PROXY_DIR}/proxy.js"
 PROXY_ENV="${PROXY_DIR}/proxy.env"
 USER_BIN_DIR="${HOME}/.local/bin"
-NODE_ROOT="${HOME}/.local/share/codalane-node"
-NODE_VERSION="${CODALANE_NODE_VERSION:-20.18.1}"
-PROXY_LAUNCHER="${USER_BIN_DIR}/ccswitch-proxy"
+NODE_ROOT="${HOME}/.local/share/agent-router-node"
+NODE_VERSION="${AGENT_ROUTER_NODE_VERSION:-20.18.1}"
+PROXY_LAUNCHER="${USER_BIN_DIR}/agent-router-proxy"
 SWITCHER_BIN="${USER_BIN_DIR}/ccr"
-SWITCHER_ALIAS="${USER_BIN_DIR}/cc-router"
-SWITCHER_LEGACY_BIN="${USER_BIN_DIR}/codalane"
-SWITCHER_LEGACY_ALIAS="${USER_BIN_DIR}/codalane-switch"
+SWITCHER_ALIAS="${USER_BIN_DIR}/agent-router"
 SERVICE_DIR="${HOME}/.config/systemd/user"
-SERVICE_FILE="${SERVICE_DIR}/ccswitch-proxy.service"
+SERVICE_FILE="${SERVICE_DIR}/agent-router-proxy.service"
 
 say() {
   printf '%s\n' "$*"
@@ -50,7 +48,7 @@ download_node_archive() {
   local output="$3"
   local archive="node-v${version}-linux-${arch}.tar.xz"
   local base_urls=(
-    "${CODALANE_NODE_MIRROR:-https://nodejs.org/dist}"
+    "${AGENT_ROUTER_NODE_MIRROR:-https://nodejs.org/dist}"
     "https://npmmirror.com/mirrors/node"
   )
   local base_url
@@ -125,6 +123,20 @@ prompt_required_secret() {
   done
 }
 
+prompt_required() {
+  local prompt="$1"
+  local value
+
+  while true; do
+    value="$(read_from_tty "${prompt}: ")"
+    if [ -n "$value" ]; then
+      printf '%s' "$value"
+      return 0
+    fi
+    printf '%s\n' "Input was empty. Enter a value, then press Enter." >/dev/tty
+  done
+}
+
 tty_say() {
   printf '%s\n' "$*" >/dev/tty
 }
@@ -140,6 +152,14 @@ model_note() {
     printf '%s' "recommended primary, 1M context"
   elif [ "$model" = "deepseek-v4-flash" ]; then
     printf '%s' "recommended small/fast"
+  elif [ "$model" = "kimi-k2.5" ]; then
+    printf '%s' "recommended for Claude Code"
+  elif [ "$model" = "kimi-k2.6" ]; then
+    printf '%s' "latest"
+  elif [ "$model" = "kimi-k2-turbo-preview" ]; then
+    printf '%s' "faster"
+  elif [ "$model" = "kimi-k2-thinking" ]; then
+    printf '%s' "thinking"
   fi
 }
 
@@ -180,6 +200,17 @@ select_model_menu() {
         "deepseek-v4-flash"
         "deepseek-v4-pro"
         "deepseek-v4-pro[1m]"
+      )
+      ;;
+    kimi:primary|kimi:small)
+      models=(
+        "kimi-k2.5"
+        "kimi-k2.6"
+        "kimi-k2-turbo-preview"
+        "kimi-k2-thinking"
+        "kimi-k2-thinking-turbo"
+        "kimi-k2-0905-preview"
+        "kimi-k2-0711-preview"
       )
       ;;
     *)
@@ -223,6 +254,96 @@ select_model_menu() {
   fi
 
   printf '%s' "$choice"
+}
+
+normalize_openai_base_url() {
+  local base_url="${1:-http://127.0.0.1:8000/v1}"
+  base_url="${base_url%/}"
+  case "$base_url" in
+    */v1) printf '%s' "$base_url" ;;
+    *) printf '%s' "${base_url}/v1" ;;
+  esac
+}
+
+discover_openai_models() {
+  local base_url="$1"
+  local models_url="${base_url%/}/models"
+
+  need_cmd curl || return 1
+  need_cmd node || return 1
+
+  curl -fsS --connect-timeout 5 --max-time 10 "$models_url" 2>/dev/null | node -e '
+const chunks = [];
+process.stdin.on("data", chunk => chunks.push(chunk));
+process.stdin.on("end", () => {
+  const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  const models = Array.isArray(payload.data) ? payload.data : [];
+  for (const model of models) {
+    if (model && typeof model.id === "string" && model.id.length > 0) {
+      console.log(model.id);
+    }
+  }
+});
+' 2>/dev/null
+}
+
+select_discovered_model_menu() {
+  local prompt="$1"
+  shift
+  local models=("$@")
+  local i
+  local choice
+  local custom_choice
+  local default_choice=1
+
+  custom_choice=$((${#models[@]} + 1))
+
+  tty_say "$prompt:"
+  for i in "${!models[@]}"; do
+    tty_say "  $((i + 1))) ${models[$i]}"
+  done
+  tty_say "  ${custom_choice}) Custom model name"
+
+  choice="$(prompt_default 'Model choice' "$default_choice")"
+  if [[ "$choice" =~ ^[0-9]+$ ]]; then
+    if [ "$choice" -ge 1 ] && [ "$choice" -le "${#models[@]}" ]; then
+      printf '%s' "${models[$((choice - 1))]}"
+      return
+    fi
+    if [ "$choice" -eq "$custom_choice" ]; then
+      printf '%s' "$(prompt_required 'Custom model name')"
+      return
+    fi
+  fi
+
+  printf '%s' "$choice"
+}
+
+select_openai_model_from_base_url() {
+  local base_url="$1"
+  local fallback_model="${2:-}"
+  local model_lines
+  local models=()
+  local model
+
+  tty_say "Checking models from ${base_url%/}/models..."
+  if model_lines="$(discover_openai_models "$base_url")" && [ -n "$model_lines" ]; then
+    while IFS= read -r model; do
+      [ -n "$model" ] && models+=("$model")
+    done <<< "$model_lines"
+
+    if [ "${#models[@]}" -gt 0 ]; then
+      select_discovered_model_menu "Discovered models" "${models[@]}"
+      return
+    fi
+  fi
+
+  tty_say "Could not discover models from ${base_url%/}/models."
+  if [ -n "$fallback_model" ]; then
+    printf '%s' "$(prompt_default 'Model name' "$fallback_model")"
+  else
+    printf '%s' "$(prompt_required 'Model name')"
+  fi
 }
 
 confirm() {
@@ -272,11 +393,11 @@ install_npm_if_needed() {
 
   if [ ! -x "${node_dir}/bin/npm" ]; then
     local tmp_dir
-    tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codalane-node.XXXXXX")"
+    tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agent-router-node.XXXXXX")"
     local archive="${tmp_dir}/node.tar.xz"
 
     download_node_archive "$NODE_VERSION" "$arch" "$archive" \
-      || die "Failed to download Node.js. Check network access to nodejs.org or set CODALANE_NODE_MIRROR."
+      || die "Failed to download Node.js. Check network access to nodejs.org or set AGENT_ROUTER_NODE_MIRROR."
 
     mkdir -p "$node_dir"
     tar -xJf "$archive" -C "$node_dir" --strip-components=1 \
@@ -319,6 +440,7 @@ write_direct_settings() {
   local large_model="${6:-$3}"
   local subagent_model="${7:-$small_model}"
   local disable_nonstreaming_fallback="${8:-}"
+  local enable_tool_search="${9:-}"
   local extra_env_lines=""
 
   if [ -n "$disable_nonstreaming_fallback" ]; then
@@ -326,6 +448,9 @@ write_direct_settings() {
   fi
   if [ -n "$effort_level" ]; then
     extra_env_lines="$(printf '%s,\n    "CLAUDE_CODE_EFFORT_LEVEL": "%s"' "$extra_env_lines" "$effort_level")"
+  fi
+  if [ -n "$enable_tool_search" ]; then
+    extra_env_lines="$(printf '%s,\n    "ENABLE_TOOL_SEARCH": "%s"' "$extra_env_lines" "$enable_tool_search")"
   fi
 
   mkdir -p "$CLAUDE_DIR"
@@ -359,6 +484,7 @@ write_proxy_files() {
   local api_key="$3"
   local port="$4"
   local auth_header="$5"
+  local api_format="${6:-anthropic}"
 
   mkdir -p "$PROXY_DIR" "$USER_BIN_DIR"
   chmod 700 "$PROXY_DIR"
@@ -370,10 +496,12 @@ const https = require('https');
 const { URL } = require('url');
 
 const port = Number(process.env.PORT || '8080');
-const provider = process.env.CCSWITCH_PROVIDER || 'minimax';
+const provider = process.env.AGENT_ROUTER_PROVIDER || 'minimax';
 const apiKey = process.env.UPSTREAM_API_KEY || process.env.MINIMAX_API_KEY;
 const baseUrl = process.env.UPSTREAM_BASE_URL || process.env.MINIMAX_BASE_URL || 'https://api.minimaxi.com/anthropic';
 const authHeader = (process.env.UPSTREAM_AUTH_HEADER || (provider === 'deepseek' ? 'x-api-key' : 'authorization')).toLowerCase();
+const apiFormat = (process.env.UPSTREAM_API_FORMAT || 'anthropic').toLowerCase();
+const normalizedApiFormat = apiFormat === 'openai' ? 'openai-chat' : apiFormat;
 
 if (!apiKey) {
   console.error('UPSTREAM_API_KEY is required');
@@ -382,6 +510,11 @@ if (!apiKey) {
 
 if (!['authorization', 'bearer', 'x-api-key'].includes(authHeader)) {
   console.error(`Unsupported UPSTREAM_AUTH_HEADER: ${authHeader}`);
+  process.exit(1);
+}
+
+if (!['anthropic', 'openai-chat'].includes(normalizedApiFormat)) {
+  console.error(`Unsupported UPSTREAM_API_FORMAT: ${apiFormat}`);
   process.exit(1);
 }
 
@@ -400,13 +533,432 @@ function authHeaders() {
   return { authorization: `Bearer ${apiKey}` };
 }
 
-const server = http.createServer((req, res) => {
-  if (req.method === 'GET' && req.url === '/health') {
-    sendJson(res, 200, { status: 'ok' });
+function upstreamPath(suffix) {
+  const basePath = upstream.pathname.replace(/\/+$/, '');
+  return `${basePath}/${suffix.replace(/^\/+/, '')}`;
+}
+
+function textFromContent(content) {
+  if (content == null) {
+    return '';
+  }
+  if (typeof content === 'string') {
+    return content;
+  }
+  if (!Array.isArray(content)) {
+    if (typeof content.text === 'string') {
+      return content.text;
+    }
+    return JSON.stringify(content);
+  }
+
+  return content
+    .map(block => {
+      if (!block) {
+        return '';
+      }
+      if (typeof block === 'string') {
+        return block;
+      }
+      if (block.type === 'text' && typeof block.text === 'string') {
+        return block.text;
+      }
+      if (block.type === 'tool_result') {
+        return textFromContent(block.content);
+      }
+      if (typeof block.text === 'string') {
+        return block.text;
+      }
+      return '';
+    })
+    .filter(Boolean)
+    .join('\n');
+}
+
+function parseJsonObject(value) {
+  if (!value) {
+    return {};
+  }
+  try {
+    const parsed = JSON.parse(value);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return parsed;
+    }
+    return { value: parsed };
+  } catch {
+    return {};
+  }
+}
+
+function finishReasonToStopReason(reason) {
+  if (reason === 'length') {
+    return 'max_tokens';
+  }
+  if (reason === 'tool_calls' || reason === 'function_call') {
+    return 'tool_use';
+  }
+  if (reason === 'stop') {
+    return 'end_turn';
+  }
+  return reason || 'end_turn';
+}
+
+function convertToolChoice(choice) {
+  if (!choice) {
+    return undefined;
+  }
+  if (typeof choice === 'string') {
+    return choice;
+  }
+  if (choice.type === 'auto') {
+    return 'auto';
+  }
+  if (choice.type === 'any') {
+    return 'required';
+  }
+  if (choice.type === 'tool' && choice.name) {
+    return { type: 'function', function: { name: choice.name } };
+  }
+  return undefined;
+}
+
+function anthropicToOpenAI(body) {
+  const messages = [];
+  const systemText = textFromContent(body.system);
+  if (systemText) {
+    messages.push({ role: 'system', content: systemText });
+  }
+
+  for (const message of body.messages || []) {
+    const role = message.role === 'assistant' ? 'assistant' : 'user';
+    const content = message.content;
+
+    if (role === 'assistant' && Array.isArray(content)) {
+      const textParts = [];
+      const toolCalls = [];
+      for (const block of content) {
+        if (!block) {
+          continue;
+        }
+        if (block.type === 'tool_use') {
+          toolCalls.push({
+            id: block.id || `call_${toolCalls.length}`,
+            type: 'function',
+            function: {
+              name: block.name || 'tool',
+              arguments: JSON.stringify(block.input || {})
+            }
+          });
+        } else {
+          const text = textFromContent([block]);
+          if (text) {
+            textParts.push(text);
+          }
+        }
+      }
+      const openAIMessage = { role: 'assistant', content: textParts.join('\n') || null };
+      if (toolCalls.length > 0) {
+        openAIMessage.tool_calls = toolCalls;
+      }
+      messages.push(openAIMessage);
+      continue;
+    }
+
+    if (role === 'user' && Array.isArray(content)) {
+      const textParts = [];
+      const toolResults = [];
+      for (const block of content) {
+        if (block && block.type === 'tool_result') {
+          toolResults.push({
+            role: 'tool',
+            tool_call_id: block.tool_use_id,
+            content: textFromContent(block.content)
+          });
+        } else {
+          const text = textFromContent([block]);
+          if (text) {
+            textParts.push(text);
+          }
+        }
+      }
+      if (textParts.length > 0) {
+        messages.push({ role: 'user', content: textParts.join('\n') });
+      }
+      for (const toolResult of toolResults) {
+        messages.push(toolResult);
+      }
+      if (textParts.length === 0 && toolResults.length === 0) {
+        messages.push({ role: 'user', content: '' });
+      }
+      continue;
+    }
+
+    messages.push({ role, content: textFromContent(content) });
+  }
+
+  const openAIRequest = {
+    model: body.model,
+    messages,
+    stream: !!body.stream
+  };
+
+  if (typeof body.max_tokens === 'number') {
+    openAIRequest.max_tokens = body.max_tokens;
+  }
+  if (typeof body.temperature === 'number') {
+    openAIRequest.temperature = body.temperature;
+  }
+  if (typeof body.top_p === 'number') {
+    openAIRequest.top_p = body.top_p;
+  }
+  if (Array.isArray(body.stop_sequences) && body.stop_sequences.length > 0) {
+    openAIRequest.stop = body.stop_sequences;
+  }
+  if (Array.isArray(body.tools) && body.tools.length > 0) {
+    openAIRequest.tools = body.tools.map(tool => ({
+      type: 'function',
+      function: {
+        name: tool.name,
+        description: tool.description || '',
+        parameters: tool.input_schema || { type: 'object', properties: {} }
+      }
+    }));
+    const toolChoice = convertToolChoice(body.tool_choice);
+    if (toolChoice) {
+      openAIRequest.tool_choice = toolChoice;
+    }
+  }
+
+  return openAIRequest;
+}
+
+function openAIToAnthropic(payload, requestedModel) {
+  const choice = (payload.choices || [])[0] || {};
+  const message = choice.message || {};
+  const content = [];
+
+  if (message.content) {
+    content.push({ type: 'text', text: Array.isArray(message.content) ? textFromContent(message.content) : String(message.content) });
+  }
+
+  for (const call of message.tool_calls || []) {
+    content.push({
+      type: 'tool_use',
+      id: call.id || `call_${content.length}`,
+      name: (call.function && call.function.name) || 'tool',
+      input: parseJsonObject(call.function && call.function.arguments)
+    });
+  }
+
+  if (content.length === 0) {
+    content.push({ type: 'text', text: '' });
+  }
+
+  return {
+    id: payload.id || `msg_${Date.now()}`,
+    type: 'message',
+    role: 'assistant',
+    model: payload.model || requestedModel,
+    content,
+    stop_reason: finishReasonToStopReason(choice.finish_reason),
+    stop_sequence: null,
+    usage: {
+      input_tokens: (payload.usage && payload.usage.prompt_tokens) || 0,
+      output_tokens: (payload.usage && payload.usage.completion_tokens) || 0
+    }
+  };
+}
+
+function sendSse(res, event, data) {
+  res.write(`event: ${event}\n`);
+  res.write(`data: ${JSON.stringify(data)}\n\n`);
+}
+
+function pipeOpenAIStreamToAnthropic(proxyRes, res, requestedModel) {
+  if ((proxyRes.statusCode || 500) >= 400) {
+    res.writeHead(proxyRes.statusCode || 502, { ...proxyRes.headers, 'x-proxied-by': 'agent-router-proxy-server' });
+    proxyRes.pipe(res);
     return;
   }
 
-  if (req.method !== 'POST' || req.url !== '/v1/messages') {
+  res.writeHead(200, {
+    'content-type': 'text/event-stream; charset=utf-8',
+    'cache-control': 'no-cache',
+    connection: 'keep-alive',
+    'x-proxied-by': 'agent-router-proxy-server'
+  });
+
+  const messageId = `msg_${Date.now()}`;
+  let nextBlockIndex = 0;
+  let currentTextIndex = null;
+  let stopReason = 'end_turn';
+  let usage = { output_tokens: 0 };
+  let finished = false;
+  const toolStates = new Map();
+
+  sendSse(res, 'message_start', {
+    type: 'message_start',
+    message: {
+      id: messageId,
+      type: 'message',
+      role: 'assistant',
+      model: requestedModel,
+      content: [],
+      stop_reason: null,
+      stop_sequence: null,
+      usage: { input_tokens: 0, output_tokens: 0 }
+    }
+  });
+
+  function closeTextBlock() {
+    if (currentTextIndex != null) {
+      sendSse(res, 'content_block_stop', { type: 'content_block_stop', index: currentTextIndex });
+      currentTextIndex = null;
+    }
+  }
+
+  function writeTextDelta(text) {
+    if (currentTextIndex == null) {
+      currentTextIndex = nextBlockIndex++;
+      sendSse(res, 'content_block_start', {
+        type: 'content_block_start',
+        index: currentTextIndex,
+        content_block: { type: 'text', text: '' }
+      });
+    }
+    sendSse(res, 'content_block_delta', {
+      type: 'content_block_delta',
+      index: currentTextIndex,
+      delta: { type: 'text_delta', text }
+    });
+  }
+
+  function startToolBlock(state) {
+    if (state.started) {
+      return;
+    }
+    closeTextBlock();
+    state.blockIndex = nextBlockIndex++;
+    state.started = true;
+    sendSse(res, 'content_block_start', {
+      type: 'content_block_start',
+      index: state.blockIndex,
+      content_block: {
+        type: 'tool_use',
+        id: state.id || `call_${state.key}`,
+        name: state.name || 'tool',
+        input: {}
+      }
+    });
+    if (state.buffer) {
+      sendSse(res, 'content_block_delta', {
+        type: 'content_block_delta',
+        index: state.blockIndex,
+        delta: { type: 'input_json_delta', partial_json: state.buffer }
+      });
+      state.buffer = '';
+    }
+  }
+
+  function finishStream() {
+    if (finished) {
+      return;
+    }
+    finished = true;
+
+    if (nextBlockIndex === 0) {
+      writeTextDelta('');
+    }
+    closeTextBlock();
+    for (const state of toolStates.values()) {
+      startToolBlock(state);
+      sendSse(res, 'content_block_stop', { type: 'content_block_stop', index: state.blockIndex });
+    }
+    sendSse(res, 'message_delta', {
+      type: 'message_delta',
+      delta: { stop_reason: stopReason, stop_sequence: null },
+      usage
+    });
+    sendSse(res, 'message_stop', { type: 'message_stop' });
+    res.end();
+  }
+
+  function processChunk(payload) {
+    const choice = (payload.choices || [])[0] || {};
+    const delta = choice.delta || {};
+    if (payload.usage) {
+      usage = { output_tokens: payload.usage.completion_tokens || 0 };
+    }
+    if (choice.finish_reason) {
+      stopReason = finishReasonToStopReason(choice.finish_reason);
+    }
+    if (delta.content) {
+      writeTextDelta(delta.content);
+    }
+    for (const toolCall of delta.tool_calls || []) {
+      const key = toolCall.index == null ? toolStates.size : toolCall.index;
+      const state = toolStates.get(key) || { key, id: '', name: '', buffer: '', started: false, blockIndex: null };
+      if (toolCall.id) {
+        state.id = toolCall.id;
+      }
+      if (toolCall.function && toolCall.function.name) {
+        state.name = toolCall.function.name;
+      }
+      const argDelta = toolCall.function && toolCall.function.arguments ? toolCall.function.arguments : '';
+      if (argDelta) {
+        if (state.started) {
+          sendSse(res, 'content_block_delta', {
+            type: 'content_block_delta',
+            index: state.blockIndex,
+            delta: { type: 'input_json_delta', partial_json: argDelta }
+          });
+        } else {
+          state.buffer += argDelta;
+        }
+      }
+      if (state.name && !state.started) {
+        startToolBlock(state);
+      }
+      toolStates.set(key, state);
+    }
+  }
+
+  let buffer = '';
+  proxyRes.on('data', chunk => {
+    buffer += chunk.toString('utf8');
+    const events = buffer.split(/\r?\n\r?\n/);
+    buffer = events.pop() || '';
+    for (const eventText of events) {
+      const data = eventText
+        .split(/\r?\n/)
+        .filter(line => line.startsWith('data:'))
+        .map(line => line.slice(5).trimStart())
+        .join('\n');
+      if (!data) {
+        continue;
+      }
+      if (data.trim() === '[DONE]') {
+        finishStream();
+        return;
+      }
+      try {
+        processChunk(JSON.parse(data));
+      } catch (err) {
+        sendSse(res, 'error', { type: 'error', error: { type: 'proxy_parse_error', message: err.message } });
+      }
+    }
+  });
+  proxyRes.on('end', finishStream);
+}
+
+const server = http.createServer((req, res) => {
+  if (req.method === 'GET' && req.url === '/health') {
+    sendJson(res, 200, { status: 'ok', provider, api_format: normalizedApiFormat });
+    return;
+  }
+
+  const requestPath = req.url.split('?')[0];
+  if (req.method !== 'POST' || requestPath !== '/v1/messages') {
     sendJson(res, 404, { error: 'not found' });
     return;
   }
@@ -415,26 +967,75 @@ const server = http.createServer((req, res) => {
   req.on('data', chunk => chunks.push(chunk));
   req.on('end', () => {
     const body = Buffer.concat(chunks);
+    let outgoingBody = body;
+    let targetPath = upstreamPath('/v1/messages');
+    let requestedModel = provider;
+    let openAIRequest = null;
+
+    if (normalizedApiFormat === 'openai-chat') {
+      try {
+        const anthropicRequest = JSON.parse(body.toString('utf8'));
+        requestedModel = anthropicRequest.model || requestedModel;
+        openAIRequest = anthropicToOpenAI(anthropicRequest);
+        outgoingBody = Buffer.from(JSON.stringify(openAIRequest));
+        targetPath = upstreamPath('/chat/completions');
+      } catch (err) {
+        sendJson(res, 400, { error: `invalid Anthropic request for OpenAI adapter: ${err.message}` });
+        return;
+      }
+    }
+
     const options = {
       hostname: upstream.hostname,
       port: upstream.port || (upstream.protocol === 'https:' ? 443 : 80),
-      path: `${upstream.pathname.replace(/\/+$/, '')}/v1/messages`,
+      path: targetPath,
       method: 'POST',
       headers: {
-        'content-type': req.headers['content-type'] || 'application/json',
+        'content-type': 'application/json',
         ...authHeaders(),
         'anthropic-version': req.headers['anthropic-version'] || '2023-06-01',
         'anthropic-beta': req.headers['anthropic-beta'] || '',
-        'content-length': body.length
+        'content-length': outgoingBody.length
       }
     };
+
+    if (normalizedApiFormat === 'openai-chat') {
+      delete options.headers['anthropic-version'];
+      delete options.headers['anthropic-beta'];
+    }
 
     if (!options.headers['anthropic-beta']) {
       delete options.headers['anthropic-beta'];
     }
 
     const proxyReq = client.request(options, proxyRes => {
-      const headers = { ...proxyRes.headers, 'x-proxied-by': 'ccswitch-proxy-server' };
+      if (normalizedApiFormat === 'openai-chat') {
+        if (openAIRequest && openAIRequest.stream) {
+          pipeOpenAIStreamToAnthropic(proxyRes, res, requestedModel);
+          return;
+        }
+
+        const responseChunks = [];
+        proxyRes.on('data', chunk => responseChunks.push(chunk));
+        proxyRes.on('end', () => {
+          const rawResponse = Buffer.concat(responseChunks);
+          if ((proxyRes.statusCode || 500) >= 400) {
+            res.writeHead(proxyRes.statusCode || 502, { ...proxyRes.headers, 'x-proxied-by': 'agent-router-proxy-server' });
+            res.end(rawResponse);
+            return;
+          }
+
+          try {
+            const payload = JSON.parse(rawResponse.toString('utf8'));
+            sendJson(res, proxyRes.statusCode || 200, openAIToAnthropic(payload, requestedModel));
+          } catch (err) {
+            sendJson(res, 502, { error: `failed to parse OpenAI-compatible response: ${err.message}` });
+          }
+        });
+        return;
+      }
+
+      const headers = { ...proxyRes.headers, 'x-proxied-by': 'agent-router-proxy-server' };
       res.writeHead(proxyRes.statusCode || 502, headers);
       proxyRes.pipe(res);
     });
@@ -443,24 +1044,25 @@ const server = http.createServer((req, res) => {
       sendJson(res, 502, { error: `upstream error: ${err.message}` });
     });
 
-    proxyReq.write(body);
+    proxyReq.write(outgoingBody);
     proxyReq.end();
   });
 });
 
 server.listen(port, '127.0.0.1', () => {
-  console.log(`ccswitch-proxy listening on http://127.0.0.1:${port}`);
-  console.log(`forwarding ${provider} to ${baseUrl}`);
+  console.log(`agent-router-proxy listening on http://127.0.0.1:${port}`);
+  console.log(`forwarding ${provider} (${normalizedApiFormat}) to ${baseUrl}`);
 });
 EOF_PROXY
   chmod 700 "$PROXY_BIN"
 
   umask 077
   cat > "$PROXY_ENV" <<EOF_ENV
-CCSWITCH_PROVIDER=${provider}
+AGENT_ROUTER_PROVIDER=${provider}
 UPSTREAM_BASE_URL=${base_url}
 UPSTREAM_API_KEY=${api_key}
 UPSTREAM_AUTH_HEADER=${auth_header}
+UPSTREAM_API_FORMAT=${api_format}
 PORT=${port}
 EOF_ENV
   chmod 600 "$PROXY_ENV"
@@ -487,7 +1089,7 @@ write_proxy_service() {
   mkdir -p "$SERVICE_DIR"
   cat > "$SERVICE_FILE" <<EOF_SERVICE
 [Unit]
-Description=CCSwitch-compatible provider proxy for Claude Code
+Description=agent-router provider proxy for Claude Code
 After=network-online.target
 Wants=network-online.target
 
@@ -503,8 +1105,8 @@ WantedBy=default.target
 EOF_SERVICE
 
   systemctl --user daemon-reload
-  systemctl --user enable --now ccswitch-proxy.service
-  say "Started user service: ccswitch-proxy.service"
+  systemctl --user enable --now agent-router-proxy.service
+  say "Started user service: agent-router-proxy.service"
 }
 
 write_switcher_command() {
@@ -516,12 +1118,12 @@ set -euo pipefail
 
 CLAUDE_DIR="${HOME}/.claude"
 SETTINGS_FILE="${CLAUDE_DIR}/settings.json"
-PROXY_DIR="${HOME}/.local/share/ccswitch-proxy"
+PROXY_DIR="${HOME}/.local/share/agent-router-proxy"
 PROXY_BIN="${PROXY_DIR}/proxy.js"
 PROXY_ENV="${PROXY_DIR}/proxy.env"
 USER_BIN_DIR="${HOME}/.local/bin"
-PROXY_LAUNCHER="${USER_BIN_DIR}/ccswitch-proxy"
-SERVICE_FILE="${HOME}/.config/systemd/user/ccswitch-proxy.service"
+PROXY_LAUNCHER="${USER_BIN_DIR}/agent-router-proxy"
+SERVICE_FILE="${HOME}/.config/systemd/user/agent-router-proxy.service"
 
 say() {
   printf '%s\n' "$*"
@@ -584,6 +1186,20 @@ prompt_required_secret() {
   done
 }
 
+prompt_required() {
+  local prompt="$1"
+  local value
+
+  while true; do
+    value="$(read_from_tty "${prompt}: ")"
+    if [ -n "$value" ]; then
+      printf '%s' "$value"
+      return 0
+    fi
+    printf '%s\n' "Input was empty. Enter a value, then press Enter." >/dev/tty
+  done
+}
+
 tty_say() {
   printf '%s\n' "$*" >/dev/tty
 }
@@ -599,6 +1215,14 @@ model_note() {
     printf '%s' "recommended primary, 1M context"
   elif [ "$model" = "deepseek-v4-flash" ]; then
     printf '%s' "recommended small/fast"
+  elif [ "$model" = "kimi-k2.5" ]; then
+    printf '%s' "recommended for Claude Code"
+  elif [ "$model" = "kimi-k2.6" ]; then
+    printf '%s' "latest"
+  elif [ "$model" = "kimi-k2-turbo-preview" ]; then
+    printf '%s' "faster"
+  elif [ "$model" = "kimi-k2-thinking" ]; then
+    printf '%s' "thinking"
   fi
 }
 
@@ -639,6 +1263,17 @@ select_model_menu() {
         "deepseek-v4-flash"
         "deepseek-v4-pro"
         "deepseek-v4-pro[1m]"
+      )
+      ;;
+    kimi:primary|kimi:small)
+      models=(
+        "kimi-k2.5"
+        "kimi-k2.6"
+        "kimi-k2-turbo-preview"
+        "kimi-k2-thinking"
+        "kimi-k2-thinking-turbo"
+        "kimi-k2-0905-preview"
+        "kimi-k2-0711-preview"
       )
       ;;
     *)
@@ -684,6 +1319,96 @@ select_model_menu() {
   printf '%s' "$choice"
 }
 
+normalize_openai_base_url() {
+  local base_url="${1:-http://127.0.0.1:8000/v1}"
+  base_url="${base_url%/}"
+  case "$base_url" in
+    */v1) printf '%s' "$base_url" ;;
+    *) printf '%s' "${base_url}/v1" ;;
+  esac
+}
+
+discover_openai_models() {
+  local base_url="$1"
+  local models_url="${base_url%/}/models"
+
+  need_cmd curl || return 1
+  need_cmd node || return 1
+
+  curl -fsS --connect-timeout 5 --max-time 10 "$models_url" 2>/dev/null | node -e '
+const chunks = [];
+process.stdin.on("data", chunk => chunks.push(chunk));
+process.stdin.on("end", () => {
+  const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  const models = Array.isArray(payload.data) ? payload.data : [];
+  for (const model of models) {
+    if (model && typeof model.id === "string" && model.id.length > 0) {
+      console.log(model.id);
+    }
+  }
+});
+' 2>/dev/null
+}
+
+select_discovered_model_menu() {
+  local prompt="$1"
+  shift
+  local models=("$@")
+  local i
+  local choice
+  local custom_choice
+  local default_choice=1
+
+  custom_choice=$((${#models[@]} + 1))
+
+  tty_say "$prompt:"
+  for i in "${!models[@]}"; do
+    tty_say "  $((i + 1))) ${models[$i]}"
+  done
+  tty_say "  ${custom_choice}) Custom model name"
+
+  choice="$(prompt_default 'Model choice' "$default_choice")"
+  if [[ "$choice" =~ ^[0-9]+$ ]]; then
+    if [ "$choice" -ge 1 ] && [ "$choice" -le "${#models[@]}" ]; then
+      printf '%s' "${models[$((choice - 1))]}"
+      return
+    fi
+    if [ "$choice" -eq "$custom_choice" ]; then
+      printf '%s' "$(prompt_required 'Custom model name')"
+      return
+    fi
+  fi
+
+  printf '%s' "$choice"
+}
+
+select_openai_model_from_base_url() {
+  local base_url="$1"
+  local fallback_model="${2:-}"
+  local model_lines
+  local models=()
+  local model
+
+  tty_say "Checking models from ${base_url%/}/models..."
+  if model_lines="$(discover_openai_models "$base_url")" && [ -n "$model_lines" ]; then
+    while IFS= read -r model; do
+      [ -n "$model" ] && models+=("$model")
+    done <<< "$model_lines"
+
+    if [ "${#models[@]}" -gt 0 ]; then
+      select_discovered_model_menu "Discovered models" "${models[@]}"
+      return
+    fi
+  fi
+
+  tty_say "Could not discover models from ${base_url%/}/models."
+  if [ -n "$fallback_model" ]; then
+    printf '%s' "$(prompt_default 'Model name' "$fallback_model")"
+  else
+    printf '%s' "$(prompt_required 'Model name')"
+  fi
+}
+
 backup_if_exists() {
   local file="$1"
   if [ -f "$file" ]; then
@@ -727,9 +1452,16 @@ current_provider() {
   base_url="$(settings_env_value ANTHROPIC_BASE_URL || true)"
   case "$base_url" in
     http://127.0.0.1:*|http://localhost:*)
-      env_file_value "$PROXY_ENV" CCSWITCH_PROVIDER || true
+      local proxy_provider
+      proxy_provider="$(env_file_value "$PROXY_ENV" AGENT_ROUTER_PROVIDER || true)"
+      case "$proxy_provider" in
+        qwen) printf '%s' "vllm" ;;
+        *) printf '%s' "$proxy_provider" ;;
+      esac
       ;;
     *deepseek*) printf '%s' "deepseek" ;;
+    *moonshot*|*kimi*) printf '%s' "kimi" ;;
+    *vllm*) printf '%s' "vllm" ;;
     *minimax*|*minimaxi*) printf '%s' "minimax" ;;
     *) return 1 ;;
   esac
@@ -765,6 +1497,7 @@ write_direct_settings() {
   local large_model="${6:-$3}"
   local subagent_model="${7:-$small_model}"
   local disable_nonstreaming_fallback="${8:-}"
+  local enable_tool_search="${9:-}"
   local extra_env_lines=""
 
   if [ -n "$disable_nonstreaming_fallback" ]; then
@@ -772,6 +1505,9 @@ write_direct_settings() {
   fi
   if [ -n "$effort_level" ]; then
     extra_env_lines="$(printf '%s,\n    "CLAUDE_CODE_EFFORT_LEVEL": "%s"' "$extra_env_lines" "$effort_level")"
+  fi
+  if [ -n "$enable_tool_search" ]; then
+    extra_env_lines="$(printf '%s,\n    "ENABLE_TOOL_SEARCH": "%s"' "$extra_env_lines" "$enable_tool_search")"
   fi
 
   mkdir -p "$CLAUDE_DIR"
@@ -805,6 +1541,7 @@ write_proxy_files() {
   local api_key="$3"
   local port="$4"
   local auth_header="$5"
+  local api_format="${6:-anthropic}"
 
   mkdir -p "$PROXY_DIR" "$USER_BIN_DIR"
   chmod 700 "$PROXY_DIR"
@@ -816,10 +1553,12 @@ const https = require('https');
 const { URL } = require('url');
 
 const port = Number(process.env.PORT || '8080');
-const provider = process.env.CCSWITCH_PROVIDER || 'minimax';
+const provider = process.env.AGENT_ROUTER_PROVIDER || 'minimax';
 const apiKey = process.env.UPSTREAM_API_KEY || process.env.MINIMAX_API_KEY;
 const baseUrl = process.env.UPSTREAM_BASE_URL || process.env.MINIMAX_BASE_URL || 'https://api.minimaxi.com/anthropic';
 const authHeader = (process.env.UPSTREAM_AUTH_HEADER || (provider === 'deepseek' ? 'x-api-key' : 'authorization')).toLowerCase();
+const apiFormat = (process.env.UPSTREAM_API_FORMAT || 'anthropic').toLowerCase();
+const normalizedApiFormat = apiFormat === 'openai' ? 'openai-chat' : apiFormat;
 
 if (!apiKey) {
   console.error('UPSTREAM_API_KEY is required');
@@ -828,6 +1567,11 @@ if (!apiKey) {
 
 if (!['authorization', 'bearer', 'x-api-key'].includes(authHeader)) {
   console.error(`Unsupported UPSTREAM_AUTH_HEADER: ${authHeader}`);
+  process.exit(1);
+}
+
+if (!['anthropic', 'openai-chat'].includes(normalizedApiFormat)) {
+  console.error(`Unsupported UPSTREAM_API_FORMAT: ${apiFormat}`);
   process.exit(1);
 }
 
@@ -846,13 +1590,432 @@ function authHeaders() {
   return { authorization: `Bearer ${apiKey}` };
 }
 
-const server = http.createServer((req, res) => {
-  if (req.method === 'GET' && req.url === '/health') {
-    sendJson(res, 200, { status: 'ok' });
+function upstreamPath(suffix) {
+  const basePath = upstream.pathname.replace(/\/+$/, '');
+  return `${basePath}/${suffix.replace(/^\/+/, '')}`;
+}
+
+function textFromContent(content) {
+  if (content == null) {
+    return '';
+  }
+  if (typeof content === 'string') {
+    return content;
+  }
+  if (!Array.isArray(content)) {
+    if (typeof content.text === 'string') {
+      return content.text;
+    }
+    return JSON.stringify(content);
+  }
+
+  return content
+    .map(block => {
+      if (!block) {
+        return '';
+      }
+      if (typeof block === 'string') {
+        return block;
+      }
+      if (block.type === 'text' && typeof block.text === 'string') {
+        return block.text;
+      }
+      if (block.type === 'tool_result') {
+        return textFromContent(block.content);
+      }
+      if (typeof block.text === 'string') {
+        return block.text;
+      }
+      return '';
+    })
+    .filter(Boolean)
+    .join('\n');
+}
+
+function parseJsonObject(value) {
+  if (!value) {
+    return {};
+  }
+  try {
+    const parsed = JSON.parse(value);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return parsed;
+    }
+    return { value: parsed };
+  } catch {
+    return {};
+  }
+}
+
+function finishReasonToStopReason(reason) {
+  if (reason === 'length') {
+    return 'max_tokens';
+  }
+  if (reason === 'tool_calls' || reason === 'function_call') {
+    return 'tool_use';
+  }
+  if (reason === 'stop') {
+    return 'end_turn';
+  }
+  return reason || 'end_turn';
+}
+
+function convertToolChoice(choice) {
+  if (!choice) {
+    return undefined;
+  }
+  if (typeof choice === 'string') {
+    return choice;
+  }
+  if (choice.type === 'auto') {
+    return 'auto';
+  }
+  if (choice.type === 'any') {
+    return 'required';
+  }
+  if (choice.type === 'tool' && choice.name) {
+    return { type: 'function', function: { name: choice.name } };
+  }
+  return undefined;
+}
+
+function anthropicToOpenAI(body) {
+  const messages = [];
+  const systemText = textFromContent(body.system);
+  if (systemText) {
+    messages.push({ role: 'system', content: systemText });
+  }
+
+  for (const message of body.messages || []) {
+    const role = message.role === 'assistant' ? 'assistant' : 'user';
+    const content = message.content;
+
+    if (role === 'assistant' && Array.isArray(content)) {
+      const textParts = [];
+      const toolCalls = [];
+      for (const block of content) {
+        if (!block) {
+          continue;
+        }
+        if (block.type === 'tool_use') {
+          toolCalls.push({
+            id: block.id || `call_${toolCalls.length}`,
+            type: 'function',
+            function: {
+              name: block.name || 'tool',
+              arguments: JSON.stringify(block.input || {})
+            }
+          });
+        } else {
+          const text = textFromContent([block]);
+          if (text) {
+            textParts.push(text);
+          }
+        }
+      }
+      const openAIMessage = { role: 'assistant', content: textParts.join('\n') || null };
+      if (toolCalls.length > 0) {
+        openAIMessage.tool_calls = toolCalls;
+      }
+      messages.push(openAIMessage);
+      continue;
+    }
+
+    if (role === 'user' && Array.isArray(content)) {
+      const textParts = [];
+      const toolResults = [];
+      for (const block of content) {
+        if (block && block.type === 'tool_result') {
+          toolResults.push({
+            role: 'tool',
+            tool_call_id: block.tool_use_id,
+            content: textFromContent(block.content)
+          });
+        } else {
+          const text = textFromContent([block]);
+          if (text) {
+            textParts.push(text);
+          }
+        }
+      }
+      if (textParts.length > 0) {
+        messages.push({ role: 'user', content: textParts.join('\n') });
+      }
+      for (const toolResult of toolResults) {
+        messages.push(toolResult);
+      }
+      if (textParts.length === 0 && toolResults.length === 0) {
+        messages.push({ role: 'user', content: '' });
+      }
+      continue;
+    }
+
+    messages.push({ role, content: textFromContent(content) });
+  }
+
+  const openAIRequest = {
+    model: body.model,
+    messages,
+    stream: !!body.stream
+  };
+
+  if (typeof body.max_tokens === 'number') {
+    openAIRequest.max_tokens = body.max_tokens;
+  }
+  if (typeof body.temperature === 'number') {
+    openAIRequest.temperature = body.temperature;
+  }
+  if (typeof body.top_p === 'number') {
+    openAIRequest.top_p = body.top_p;
+  }
+  if (Array.isArray(body.stop_sequences) && body.stop_sequences.length > 0) {
+    openAIRequest.stop = body.stop_sequences;
+  }
+  if (Array.isArray(body.tools) && body.tools.length > 0) {
+    openAIRequest.tools = body.tools.map(tool => ({
+      type: 'function',
+      function: {
+        name: tool.name,
+        description: tool.description || '',
+        parameters: tool.input_schema || { type: 'object', properties: {} }
+      }
+    }));
+    const toolChoice = convertToolChoice(body.tool_choice);
+    if (toolChoice) {
+      openAIRequest.tool_choice = toolChoice;
+    }
+  }
+
+  return openAIRequest;
+}
+
+function openAIToAnthropic(payload, requestedModel) {
+  const choice = (payload.choices || [])[0] || {};
+  const message = choice.message || {};
+  const content = [];
+
+  if (message.content) {
+    content.push({ type: 'text', text: Array.isArray(message.content) ? textFromContent(message.content) : String(message.content) });
+  }
+
+  for (const call of message.tool_calls || []) {
+    content.push({
+      type: 'tool_use',
+      id: call.id || `call_${content.length}`,
+      name: (call.function && call.function.name) || 'tool',
+      input: parseJsonObject(call.function && call.function.arguments)
+    });
+  }
+
+  if (content.length === 0) {
+    content.push({ type: 'text', text: '' });
+  }
+
+  return {
+    id: payload.id || `msg_${Date.now()}`,
+    type: 'message',
+    role: 'assistant',
+    model: payload.model || requestedModel,
+    content,
+    stop_reason: finishReasonToStopReason(choice.finish_reason),
+    stop_sequence: null,
+    usage: {
+      input_tokens: (payload.usage && payload.usage.prompt_tokens) || 0,
+      output_tokens: (payload.usage && payload.usage.completion_tokens) || 0
+    }
+  };
+}
+
+function sendSse(res, event, data) {
+  res.write(`event: ${event}\n`);
+  res.write(`data: ${JSON.stringify(data)}\n\n`);
+}
+
+function pipeOpenAIStreamToAnthropic(proxyRes, res, requestedModel) {
+  if ((proxyRes.statusCode || 500) >= 400) {
+    res.writeHead(proxyRes.statusCode || 502, { ...proxyRes.headers, 'x-proxied-by': 'agent-router-proxy-server' });
+    proxyRes.pipe(res);
     return;
   }
 
-  if (req.method !== 'POST' || req.url !== '/v1/messages') {
+  res.writeHead(200, {
+    'content-type': 'text/event-stream; charset=utf-8',
+    'cache-control': 'no-cache',
+    connection: 'keep-alive',
+    'x-proxied-by': 'agent-router-proxy-server'
+  });
+
+  const messageId = `msg_${Date.now()}`;
+  let nextBlockIndex = 0;
+  let currentTextIndex = null;
+  let stopReason = 'end_turn';
+  let usage = { output_tokens: 0 };
+  let finished = false;
+  const toolStates = new Map();
+
+  sendSse(res, 'message_start', {
+    type: 'message_start',
+    message: {
+      id: messageId,
+      type: 'message',
+      role: 'assistant',
+      model: requestedModel,
+      content: [],
+      stop_reason: null,
+      stop_sequence: null,
+      usage: { input_tokens: 0, output_tokens: 0 }
+    }
+  });
+
+  function closeTextBlock() {
+    if (currentTextIndex != null) {
+      sendSse(res, 'content_block_stop', { type: 'content_block_stop', index: currentTextIndex });
+      currentTextIndex = null;
+    }
+  }
+
+  function writeTextDelta(text) {
+    if (currentTextIndex == null) {
+      currentTextIndex = nextBlockIndex++;
+      sendSse(res, 'content_block_start', {
+        type: 'content_block_start',
+        index: currentTextIndex,
+        content_block: { type: 'text', text: '' }
+      });
+    }
+    sendSse(res, 'content_block_delta', {
+      type: 'content_block_delta',
+      index: currentTextIndex,
+      delta: { type: 'text_delta', text }
+    });
+  }
+
+  function startToolBlock(state) {
+    if (state.started) {
+      return;
+    }
+    closeTextBlock();
+    state.blockIndex = nextBlockIndex++;
+    state.started = true;
+    sendSse(res, 'content_block_start', {
+      type: 'content_block_start',
+      index: state.blockIndex,
+      content_block: {
+        type: 'tool_use',
+        id: state.id || `call_${state.key}`,
+        name: state.name || 'tool',
+        input: {}
+      }
+    });
+    if (state.buffer) {
+      sendSse(res, 'content_block_delta', {
+        type: 'content_block_delta',
+        index: state.blockIndex,
+        delta: { type: 'input_json_delta', partial_json: state.buffer }
+      });
+      state.buffer = '';
+    }
+  }
+
+  function finishStream() {
+    if (finished) {
+      return;
+    }
+    finished = true;
+
+    if (nextBlockIndex === 0) {
+      writeTextDelta('');
+    }
+    closeTextBlock();
+    for (const state of toolStates.values()) {
+      startToolBlock(state);
+      sendSse(res, 'content_block_stop', { type: 'content_block_stop', index: state.blockIndex });
+    }
+    sendSse(res, 'message_delta', {
+      type: 'message_delta',
+      delta: { stop_reason: stopReason, stop_sequence: null },
+      usage
+    });
+    sendSse(res, 'message_stop', { type: 'message_stop' });
+    res.end();
+  }
+
+  function processChunk(payload) {
+    const choice = (payload.choices || [])[0] || {};
+    const delta = choice.delta || {};
+    if (payload.usage) {
+      usage = { output_tokens: payload.usage.completion_tokens || 0 };
+    }
+    if (choice.finish_reason) {
+      stopReason = finishReasonToStopReason(choice.finish_reason);
+    }
+    if (delta.content) {
+      writeTextDelta(delta.content);
+    }
+    for (const toolCall of delta.tool_calls || []) {
+      const key = toolCall.index == null ? toolStates.size : toolCall.index;
+      const state = toolStates.get(key) || { key, id: '', name: '', buffer: '', started: false, blockIndex: null };
+      if (toolCall.id) {
+        state.id = toolCall.id;
+      }
+      if (toolCall.function && toolCall.function.name) {
+        state.name = toolCall.function.name;
+      }
+      const argDelta = toolCall.function && toolCall.function.arguments ? toolCall.function.arguments : '';
+      if (argDelta) {
+        if (state.started) {
+          sendSse(res, 'content_block_delta', {
+            type: 'content_block_delta',
+            index: state.blockIndex,
+            delta: { type: 'input_json_delta', partial_json: argDelta }
+          });
+        } else {
+          state.buffer += argDelta;
+        }
+      }
+      if (state.name && !state.started) {
+        startToolBlock(state);
+      }
+      toolStates.set(key, state);
+    }
+  }
+
+  let buffer = '';
+  proxyRes.on('data', chunk => {
+    buffer += chunk.toString('utf8');
+    const events = buffer.split(/\r?\n\r?\n/);
+    buffer = events.pop() || '';
+    for (const eventText of events) {
+      const data = eventText
+        .split(/\r?\n/)
+        .filter(line => line.startsWith('data:'))
+        .map(line => line.slice(5).trimStart())
+        .join('\n');
+      if (!data) {
+        continue;
+      }
+      if (data.trim() === '[DONE]') {
+        finishStream();
+        return;
+      }
+      try {
+        processChunk(JSON.parse(data));
+      } catch (err) {
+        sendSse(res, 'error', { type: 'error', error: { type: 'proxy_parse_error', message: err.message } });
+      }
+    }
+  });
+  proxyRes.on('end', finishStream);
+}
+
+const server = http.createServer((req, res) => {
+  if (req.method === 'GET' && req.url === '/health') {
+    sendJson(res, 200, { status: 'ok', provider, api_format: normalizedApiFormat });
+    return;
+  }
+
+  const requestPath = req.url.split('?')[0];
+  if (req.method !== 'POST' || requestPath !== '/v1/messages') {
     sendJson(res, 404, { error: 'not found' });
     return;
   }
@@ -861,26 +2024,75 @@ const server = http.createServer((req, res) => {
   req.on('data', chunk => chunks.push(chunk));
   req.on('end', () => {
     const body = Buffer.concat(chunks);
+    let outgoingBody = body;
+    let targetPath = upstreamPath('/v1/messages');
+    let requestedModel = provider;
+    let openAIRequest = null;
+
+    if (normalizedApiFormat === 'openai-chat') {
+      try {
+        const anthropicRequest = JSON.parse(body.toString('utf8'));
+        requestedModel = anthropicRequest.model || requestedModel;
+        openAIRequest = anthropicToOpenAI(anthropicRequest);
+        outgoingBody = Buffer.from(JSON.stringify(openAIRequest));
+        targetPath = upstreamPath('/chat/completions');
+      } catch (err) {
+        sendJson(res, 400, { error: `invalid Anthropic request for OpenAI adapter: ${err.message}` });
+        return;
+      }
+    }
+
     const options = {
       hostname: upstream.hostname,
       port: upstream.port || (upstream.protocol === 'https:' ? 443 : 80),
-      path: `${upstream.pathname.replace(/\/+$/, '')}/v1/messages`,
+      path: targetPath,
       method: 'POST',
       headers: {
-        'content-type': req.headers['content-type'] || 'application/json',
+        'content-type': 'application/json',
         ...authHeaders(),
         'anthropic-version': req.headers['anthropic-version'] || '2023-06-01',
         'anthropic-beta': req.headers['anthropic-beta'] || '',
-        'content-length': body.length
+        'content-length': outgoingBody.length
       }
     };
+
+    if (normalizedApiFormat === 'openai-chat') {
+      delete options.headers['anthropic-version'];
+      delete options.headers['anthropic-beta'];
+    }
 
     if (!options.headers['anthropic-beta']) {
       delete options.headers['anthropic-beta'];
     }
 
     const proxyReq = client.request(options, proxyRes => {
-      const headers = { ...proxyRes.headers, 'x-proxied-by': 'ccswitch-proxy-server' };
+      if (normalizedApiFormat === 'openai-chat') {
+        if (openAIRequest && openAIRequest.stream) {
+          pipeOpenAIStreamToAnthropic(proxyRes, res, requestedModel);
+          return;
+        }
+
+        const responseChunks = [];
+        proxyRes.on('data', chunk => responseChunks.push(chunk));
+        proxyRes.on('end', () => {
+          const rawResponse = Buffer.concat(responseChunks);
+          if ((proxyRes.statusCode || 500) >= 400) {
+            res.writeHead(proxyRes.statusCode || 502, { ...proxyRes.headers, 'x-proxied-by': 'agent-router-proxy-server' });
+            res.end(rawResponse);
+            return;
+          }
+
+          try {
+            const payload = JSON.parse(rawResponse.toString('utf8'));
+            sendJson(res, proxyRes.statusCode || 200, openAIToAnthropic(payload, requestedModel));
+          } catch (err) {
+            sendJson(res, 502, { error: `failed to parse OpenAI-compatible response: ${err.message}` });
+          }
+        });
+        return;
+      }
+
+      const headers = { ...proxyRes.headers, 'x-proxied-by': 'agent-router-proxy-server' };
       res.writeHead(proxyRes.statusCode || 502, headers);
       proxyRes.pipe(res);
     });
@@ -889,24 +2101,25 @@ const server = http.createServer((req, res) => {
       sendJson(res, 502, { error: `upstream error: ${err.message}` });
     });
 
-    proxyReq.write(body);
+    proxyReq.write(outgoingBody);
     proxyReq.end();
   });
 });
 
 server.listen(port, '127.0.0.1', () => {
-  console.log(`ccswitch-proxy listening on http://127.0.0.1:${port}`);
-  console.log(`forwarding ${provider} to ${baseUrl}`);
+  console.log(`agent-router-proxy listening on http://127.0.0.1:${port}`);
+  console.log(`forwarding ${provider} (${normalizedApiFormat}) to ${baseUrl}`);
 });
 EOF_PROXY
   chmod 700 "$PROXY_BIN"
 
   umask 077
   cat > "$PROXY_ENV" <<EOF_ENV
-CCSWITCH_PROVIDER=${provider}
+AGENT_ROUTER_PROVIDER=${provider}
 UPSTREAM_BASE_URL=${base_url}
 UPSTREAM_API_KEY=${api_key}
 UPSTREAM_AUTH_HEADER=${auth_header}
+UPSTREAM_API_FORMAT=${api_format}
 PORT=${port}
 EOF_ENV
   chmod 600 "$PROXY_ENV"
@@ -928,22 +2141,22 @@ restart_proxy_service_if_running() {
     return
   fi
 
-  if systemctl --user is-active --quiet ccswitch-proxy.service; then
-    systemctl --user restart ccswitch-proxy.service
-    say "Restarted user service: ccswitch-proxy.service"
+  if systemctl --user is-active --quiet agent-router-proxy.service; then
+    systemctl --user restart agent-router-proxy.service
+    say "Restarted user service: agent-router-proxy.service"
     return
   fi
 
   if [ -f "$SERVICE_FILE" ]; then
     say "Proxy service exists but is not running. Start it with:"
-    say "  systemctl --user start ccswitch-proxy.service"
+    say "  systemctl --user start agent-router-proxy.service"
   else
     say "Proxy can be started manually with: $PROXY_LAUNCHER"
   fi
 }
 
 main() {
-  say "Claude Code Router provider switcher"
+  say "agent-router provider switcher"
   say
 
   local current_base_url
@@ -961,6 +2174,8 @@ main() {
   say "Choose upstream provider:"
   say "  1) MiniMax"
   say "  2) DeepSeek V4"
+  say "  3) Kimi"
+  say "  4) vLLM (OpenAI-compatible)"
   local provider_choice
   provider_choice="$(prompt_default 'Provider choice' '1')"
 
@@ -972,6 +2187,8 @@ main() {
   local default_small_model
   local effort_level=""
   local disable_nonstreaming_fallback=""
+  local enable_tool_search=""
+  local api_format="anthropic"
 
   case "$provider_choice" in
     2)
@@ -984,6 +2201,32 @@ main() {
       effort_level="max"
       disable_nonstreaming_fallback="1"
       say "DeepSeek Anthropic endpoint: ${base_url}"
+      ;;
+    3)
+      provider="kimi"
+      provider_label="Kimi"
+      base_url="https://api.moonshot.ai/anthropic"
+      auth_header="authorization"
+      default_model="kimi-k2.5"
+      default_small_model="$default_model"
+      enable_tool_search="false"
+      say "Kimi Anthropic endpoint: ${base_url}"
+      ;;
+    4)
+      provider="vllm"
+      provider_label="vLLM"
+      auth_header="authorization"
+      default_model=""
+      default_small_model="$default_model"
+      api_format="openai-chat"
+      local default_base_url="http://127.0.0.1:8000/v1"
+      if [ "$existing_provider" = "$provider" ]; then
+        local existing_upstream_base_url
+        existing_upstream_base_url="$(env_file_value "$PROXY_ENV" UPSTREAM_BASE_URL || true)"
+        [ -n "$existing_upstream_base_url" ] && default_base_url="$existing_upstream_base_url"
+      fi
+      base_url="$(normalize_openai_base_url "$(prompt_default 'OpenAI-compatible base URL' "$default_base_url")")"
+      say "vLLM OpenAI-compatible endpoint: ${base_url}"
       ;;
     *)
       provider="minimax"
@@ -1013,10 +2256,16 @@ main() {
   fi
 
   local model
-  model="$(select_model_menu "$provider" "primary" "$default_model" "Primary model")"
+  if [ "$provider" = "vllm" ]; then
+    model="$(select_openai_model_from_base_url "$base_url" "$default_model")"
+  else
+    model="$(select_model_menu "$provider" "primary" "$default_model" "Primary model")"
+  fi
 
   local small_model
-  if [ "$provider" = "deepseek" ]; then
+  if [ "$provider" = "vllm" ]; then
+    small_model="$model"
+  elif [ "$provider" = "deepseek" ]; then
     small_model="$(select_model_menu "$provider" "small" "$default_small_model" "Small/haiku model")"
   else
     small_model="$model"
@@ -1031,7 +2280,17 @@ main() {
     existing_api_key="$(current_api_key || true)"
   fi
 
-  if [ -n "$existing_api_key" ]; then
+  if [ "$provider" = "vllm" ]; then
+    if [ -n "$existing_api_key" ]; then
+      say "${provider_label} API Key input is hidden. Leave empty to keep the current stored key."
+      api_key="$(prompt_secret "${provider_label} API Key")"
+      api_key="${api_key:-$existing_api_key}"
+    else
+      say "${provider_label} API Key input is hidden. Leave empty to use EMPTY for a local vLLM server."
+      api_key="$(prompt_secret "${provider_label} API Key")"
+      api_key="${api_key:-EMPTY}"
+    fi
+  elif [ -n "$existing_api_key" ]; then
     say "${provider_label} API Key input is hidden. Leave empty to keep the current stored key."
     api_key="$(prompt_secret "${provider_label} API Key")"
     api_key="${api_key:-$existing_api_key}"
@@ -1040,21 +2299,31 @@ main() {
     api_key="$(prompt_required_secret "${provider_label} API Key")"
   fi
 
-  say
-  say "Choose Claude Code connection mode:"
-  say "  1) Direct mode: Claude Code calls ${provider_label} directly."
-  say "  2) Local proxy mode: Claude Code calls a 127.0.0.1 proxy."
-  local mode
-  mode="$(prompt_default 'Mode' "$(current_mode)")"
-
-  if [ "$mode" = "2" ]; then
+  if [ "$api_format" = "openai-chat" ]; then
+    say
+    say "${provider_label} uses an OpenAI-compatible API. Claude Code will use the local Anthropic adapter proxy."
     local port
     port="$(prompt_default 'Local proxy port' "$(current_proxy_port)")"
-    write_proxy_files "$provider" "$base_url" "$api_key" "$port" "$auth_header"
-    write_direct_settings "http://127.0.0.1:${port}" "not-used-by-local-proxy" "$model" "$small_model" "$effort_level" "$large_model" "$subagent_model" "$disable_nonstreaming_fallback"
+    write_proxy_files "$provider" "$base_url" "$api_key" "$port" "$auth_header" "$api_format"
+    write_direct_settings "http://127.0.0.1:${port}" "not-used-by-local-proxy" "$model" "$small_model" "$effort_level" "$large_model" "$subagent_model" "$disable_nonstreaming_fallback" "$enable_tool_search"
     restart_proxy_service_if_running
   else
-    write_direct_settings "$base_url" "$api_key" "$model" "$small_model" "$effort_level" "$large_model" "$subagent_model" "$disable_nonstreaming_fallback"
+    say
+    say "Choose Claude Code connection mode:"
+    say "  1) Direct mode: Claude Code calls ${provider_label} directly."
+    say "  2) Local proxy mode: Claude Code calls a 127.0.0.1 proxy."
+    local mode
+    mode="$(prompt_default 'Mode' "$(current_mode)")"
+
+    if [ "$mode" = "2" ]; then
+      local port
+      port="$(prompt_default 'Local proxy port' "$(current_proxy_port)")"
+      write_proxy_files "$provider" "$base_url" "$api_key" "$port" "$auth_header" "$api_format"
+      write_direct_settings "http://127.0.0.1:${port}" "not-used-by-local-proxy" "$model" "$small_model" "$effort_level" "$large_model" "$subagent_model" "$disable_nonstreaming_fallback" "$enable_tool_search"
+      restart_proxy_service_if_running
+    else
+      write_direct_settings "$base_url" "$api_key" "$model" "$small_model" "$effort_level" "$large_model" "$subagent_model" "$disable_nonstreaming_fallback" "$enable_tool_search"
+    fi
   fi
 
   say
@@ -1066,14 +2335,12 @@ EOF_SWITCHER
 
   chmod 700 "$SWITCHER_BIN"
   ln -sf "$SWITCHER_BIN" "$SWITCHER_ALIAS"
-  ln -sf "$SWITCHER_BIN" "$SWITCHER_LEGACY_BIN"
-  ln -sf "$SWITCHER_BIN" "$SWITCHER_LEGACY_ALIAS"
   say "Installed provider switcher: $SWITCHER_BIN"
-  say "Also available as: $SWITCHER_ALIAS, $SWITCHER_LEGACY_BIN, $SWITCHER_LEGACY_ALIAS"
+  say "Also available as: $SWITCHER_ALIAS"
 }
 
 main() {
-  say "Codalane: Claude Code provider headless installer"
+  say "agent-router: Claude Code provider headless installer"
   say
 
   install_claude_code
@@ -1082,6 +2349,8 @@ main() {
   say "Choose upstream provider:"
   say "  1) MiniMax"
   say "  2) DeepSeek V4"
+  say "  3) Kimi"
+  say "  4) vLLM (OpenAI-compatible)"
   local provider_choice
   provider_choice="$(prompt_default 'Provider choice' '1')"
 
@@ -1093,6 +2362,8 @@ main() {
   local default_small_model
   local effort_level=""
   local disable_nonstreaming_fallback=""
+  local enable_tool_search=""
+  local api_format="anthropic"
 
   case "$provider_choice" in
     2)
@@ -1105,6 +2376,26 @@ main() {
       effort_level="max"
       disable_nonstreaming_fallback="1"
       say "DeepSeek Anthropic endpoint: ${base_url}"
+      ;;
+    3)
+      provider="kimi"
+      provider_label="Kimi"
+      base_url="https://api.moonshot.ai/anthropic"
+      auth_header="authorization"
+      default_model="kimi-k2.5"
+      default_small_model="$default_model"
+      enable_tool_search="false"
+      say "Kimi Anthropic endpoint: ${base_url}"
+      ;;
+    4)
+      provider="vllm"
+      provider_label="vLLM"
+      auth_header="authorization"
+      default_model=""
+      default_small_model="$default_model"
+      api_format="openai-chat"
+      base_url="$(normalize_openai_base_url "$(prompt_default 'OpenAI-compatible base URL' 'http://127.0.0.1:8000/v1')")"
+      say "vLLM OpenAI-compatible endpoint: ${base_url}"
       ;;
     *)
       provider="minimax"
@@ -1125,10 +2416,16 @@ main() {
   esac
 
   local model
-  model="$(select_model_menu "$provider" "primary" "$default_model" "Primary model")"
+  if [ "$provider" = "vllm" ]; then
+    model="$(select_openai_model_from_base_url "$base_url" "$default_model")"
+  else
+    model="$(select_model_menu "$provider" "primary" "$default_model" "Primary model")"
+  fi
 
   local small_model
-  if [ "$provider" = "deepseek" ]; then
+  if [ "$provider" = "vllm" ]; then
+    small_model="$model"
+  elif [ "$provider" = "deepseek" ]; then
     small_model="$(select_model_menu "$provider" "small" "$default_small_model" "Small/haiku model")"
   else
     small_model="$model"
@@ -1138,21 +2435,22 @@ main() {
   local subagent_model="$small_model"
 
   local api_key
-  say "${provider_label} API Key input is hidden. Paste the key, then press Enter."
-  api_key="$(prompt_required_secret "${provider_label} API Key")"
+  if [ "$provider" = "vllm" ]; then
+    say "${provider_label} API Key input is hidden. Leave empty to use EMPTY for a local vLLM server."
+    api_key="$(prompt_secret "${provider_label} API Key")"
+    api_key="${api_key:-EMPTY}"
+  else
+    say "${provider_label} API Key input is hidden. Paste the key, then press Enter."
+    api_key="$(prompt_required_secret "${provider_label} API Key")"
+  fi
 
-  say
-  say "Choose Claude Code connection mode:"
-  say "  1) Direct mode: Claude Code calls ${provider_label} directly. Recommended."
-  say "  2) Local proxy mode: install a local 127.0.0.1 proxy, then Claude Code calls the proxy."
-  local mode
-  mode="$(prompt_default 'Mode' '1')"
-
-  if [ "$mode" = "2" ]; then
+  if [ "$api_format" = "openai-chat" ]; then
+    say
+    say "${provider_label} uses an OpenAI-compatible API. Claude Code will use the local Anthropic adapter proxy."
     local port
     port="$(prompt_default 'Local proxy port' '8080')"
-    write_proxy_files "$provider" "$base_url" "$api_key" "$port" "$auth_header"
-    write_direct_settings "http://127.0.0.1:${port}" "not-used-by-local-proxy" "$model" "$small_model" "$effort_level" "$large_model" "$subagent_model" "$disable_nonstreaming_fallback"
+    write_proxy_files "$provider" "$base_url" "$api_key" "$port" "$auth_header" "$api_format"
+    write_direct_settings "http://127.0.0.1:${port}" "not-used-by-local-proxy" "$model" "$small_model" "$effort_level" "$large_model" "$subagent_model" "$disable_nonstreaming_fallback" "$enable_tool_search"
 
     if confirm 'Start proxy as a systemd user service now?' 'Y'; then
       write_proxy_service
@@ -1160,7 +2458,27 @@ main() {
       say "Proxy can be started manually with: $PROXY_LAUNCHER"
     fi
   else
-    write_direct_settings "$base_url" "$api_key" "$model" "$small_model" "$effort_level" "$large_model" "$subagent_model" "$disable_nonstreaming_fallback"
+    say
+    say "Choose Claude Code connection mode:"
+    say "  1) Direct mode: Claude Code calls ${provider_label} directly. Recommended."
+    say "  2) Local proxy mode: install a local 127.0.0.1 proxy, then Claude Code calls the proxy."
+    local mode
+    mode="$(prompt_default 'Mode' '1')"
+
+    if [ "$mode" = "2" ]; then
+      local port
+      port="$(prompt_default 'Local proxy port' '8080')"
+      write_proxy_files "$provider" "$base_url" "$api_key" "$port" "$auth_header" "$api_format"
+      write_direct_settings "http://127.0.0.1:${port}" "not-used-by-local-proxy" "$model" "$small_model" "$effort_level" "$large_model" "$subagent_model" "$disable_nonstreaming_fallback" "$enable_tool_search"
+
+      if confirm 'Start proxy as a systemd user service now?' 'Y'; then
+        write_proxy_service
+      else
+        say "Proxy can be started manually with: $PROXY_LAUNCHER"
+      fi
+    else
+      write_direct_settings "$base_url" "$api_key" "$model" "$small_model" "$effort_level" "$large_model" "$subagent_model" "$disable_nonstreaming_fallback" "$enable_tool_search"
+    fi
   fi
 
   write_switcher_command
