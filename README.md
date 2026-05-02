@@ -32,19 +32,179 @@ export AGENT_ROUTER_NODE_MIRROR=https://npmmirror.com/mirrors/node
 
 ## 配置向导
 
-运行 `install.sh` 或 `ccr` 后，按提示完成配置：
+安装时运行：
 
-1. 选择模型服务提供方：MiniMax、DeepSeek V4、Kimi 或 vLLM
-2. 按提示选择或填写服务地址
-3. 选择脚本列出的模型，或输入自定义模型名
-4. 输入对应服务的 API key
-5. 选择连接模式
-   - Direct mode：Claude Code 直接请求上游服务
-   - Local proxy mode：Claude Code 先请求本地 `agent-router-proxy`，再由代理转发到上游服务
-6. 如果选择本地代理，填写本地代理端口，默认 `8080` 直接回车即可
-7. 如果提示是否启动 systemd 用户服务，建议选择 `Y`，这样重启后代理会自动启动
+```bash
+bash install.sh
+```
 
-配置完成后，重新打开 Claude Code：
+以后想换模型或换服务商，运行：
+
+```bash
+ccr
+```
+
+提示里的方括号表示默认值。例如 `[1]`、`[8080]` 都可以直接按回车使用默认值。
+
+### 选择服务商
+
+脚本会显示：
+
+```text
+Choose upstream provider:
+  1) MiniMax
+  2) DeepSeek V4
+  3) Kimi
+  4) vLLM (OpenAI-compatible)
+Provider choice [1]:
+```
+
+输入数字后回车：
+
+- 用 MiniMax：直接回车，或输入 `1`
+- 用 DeepSeek V4：输入 `2`
+- 用 Kimi：输入 `3`
+- 用自己的 vLLM：输入 `4`
+
+### 填写服务地址
+
+MiniMax 会让你选国内或国际地址：
+
+```text
+Choose MiniMax endpoint:
+  1) China mainland: https://api.minimaxi.com/anthropic
+  2) International:  https://api.minimax.io/anthropic
+Endpoint choice [1]:
+```
+
+在国内使用通常直接回车。需要国际站时输入 `2`。
+
+DeepSeek V4 和 Kimi 使用脚本内置的默认地址，一般不需要手动填写。
+
+vLLM 会让你填写 OpenAI-compatible base URL：
+
+```text
+OpenAI-compatible base URL [http://127.0.0.1:8000/v1]:
+```
+
+如果 vLLM 就在本机默认端口，直接回车。如果 vLLM 在其它机器，填写你的地址，例如：
+
+```text
+http://113.249.108.72:15581/v1
+```
+
+也可以只填到端口：
+
+```text
+http://113.249.108.72:15581
+```
+
+脚本会自动补成 `/v1`。
+
+### 选择模型
+
+MiniMax、DeepSeek V4、Kimi 会显示模型菜单，例如：
+
+```text
+Primary model:
+  1) kimi-k2.5 (recommended for Claude Code)
+  2) kimi-k2.6 (latest)
+  3) kimi-k2-turbo-preview (faster)
+  4) kimi-k2-thinking (thinking)
+  5) Custom model name
+Model choice [1]:
+```
+
+通常直接回车使用推荐模型。要用列表里的其它模型，就输入对应数字。要手动填写模型名，选 `Custom model name` 对应的数字。
+
+vLLM 会先尝试读取服务端模型列表：
+
+```text
+Checking models from http://127.0.0.1:8000/v1/models...
+Discovered models:
+  1) Qwen/Qwen3.6-35B-A3B
+  2) Custom model name
+Model choice [1]:
+```
+
+如果模型被发现，直接回车即可。如果没有发现，会看到：
+
+```text
+Could not discover models from http://127.0.0.1:8000/v1/models.
+Model name:
+```
+
+这时手动输入 vLLM 启动时的模型名，例如：
+
+```text
+Qwen/Qwen3.6-35B-A3B
+```
+
+### 填写 API key
+
+脚本会提示：
+
+```text
+API Key input is hidden. Paste the key, then press Enter.
+API Key:
+```
+
+粘贴 key 后回车。输入过程不会显示字符，这是正常的。
+
+如果是本机无鉴权 vLLM，会显示：
+
+```text
+vLLM API Key input is hidden. Leave empty to use EMPTY for a local vLLM server.
+vLLM API Key:
+```
+
+本机 vLLM 没有开启鉴权时，直接回车即可。远程 vLLM 或开启鉴权的 vLLM，需要粘贴真实 API key。
+
+再次运行 `ccr` 且服务商不变时，API key 可以留空，脚本会复用已保存的 key。
+
+### 选择连接模式
+
+MiniMax、DeepSeek V4、Kimi 会让你选择连接方式：
+
+```text
+Choose Claude Code connection mode:
+  1) Direct mode: Claude Code calls Kimi directly. Recommended.
+  2) Local proxy mode: install a local 127.0.0.1 proxy, then Claude Code calls the proxy.
+Mode [1]:
+```
+
+一般直接回车，使用 `Direct mode`。只有你明确想让 Claude Code 先走本机代理时，才输入 `2`。
+
+vLLM 不会出现这个选择，因为它固定需要本地代理做协议适配。你会看到：
+
+```text
+vLLM uses an OpenAI-compatible API. Claude Code will use the local Anthropic adapter proxy.
+Local proxy port [8080]:
+```
+
+这里填的是 Claude Code 连接本机代理的端口，不是 vLLM 服务端口。通常直接回车使用 `8080`。如果 `8080` 已被占用，可以输入其它本机空闲端口，例如：
+
+```text
+18080
+```
+
+### 启动本地代理服务
+
+如果使用 vLLM 或选择了 Local proxy mode，脚本会询问：
+
+```text
+Start proxy as a systemd user service now? [Y/n]:
+```
+
+建议直接回车，等同于选择 `Y`。这样代理会注册为 `agent-router-proxy.service`，电脑或服务器重启后会自动启动；以后只要不换模型，通常不需要再运行脚本。
+
+配置完成后，脚本会提示：
+
+```text
+Done. Open Claude Code again for the new provider/model to take effect.
+```
+
+然后重新打开 Claude Code：
 
 ```bash
 claude
