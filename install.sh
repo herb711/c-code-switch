@@ -502,6 +502,7 @@ const baseUrl = process.env.UPSTREAM_BASE_URL || process.env.MINIMAX_BASE_URL ||
 const authHeader = (process.env.UPSTREAM_AUTH_HEADER || (provider === 'deepseek' ? 'x-api-key' : 'authorization')).toLowerCase();
 const apiFormat = (process.env.UPSTREAM_API_FORMAT || 'anthropic').toLowerCase();
 const normalizedApiFormat = apiFormat === 'openai' ? 'openai-chat' : apiFormat;
+const maxTokensLimit = Number(process.env.UPSTREAM_MAX_TOKENS || (provider === 'vllm' ? '4096' : '0'));
 
 if (!apiKey) {
   console.error('UPSTREAM_API_KEY is required');
@@ -703,7 +704,7 @@ function anthropicToOpenAI(body) {
   };
 
   if (typeof body.max_tokens === 'number') {
-    openAIRequest.max_tokens = body.max_tokens;
+    openAIRequest.max_tokens = maxTokensLimit > 0 ? Math.min(body.max_tokens, maxTokensLimit) : body.max_tokens;
   }
   if (typeof body.temperature === 'number') {
     openAIRequest.temperature = body.temperature;
@@ -1067,9 +1068,10 @@ PORT=${port}
 EOF_ENV
   chmod 600 "$PROXY_ENV"
 
-  cat > "$PROXY_LAUNCHER" <<EOF_LAUNCHER
+cat > "$PROXY_LAUNCHER" <<EOF_LAUNCHER
 #!/usr/bin/env bash
 set -euo pipefail
+export PATH="${USER_BIN_DIR}:\${PATH}"
 set -a
 . "${PROXY_ENV}"
 set +a
@@ -1099,6 +1101,7 @@ ExecStart=${PROXY_LAUNCHER}
 Restart=always
 RestartSec=5
 Environment=HOME=${HOME}
+Environment=PATH=${USER_BIN_DIR}:/usr/local/bin:/usr/bin:/bin
 
 [Install]
 WantedBy=default.target
@@ -1559,6 +1562,7 @@ const baseUrl = process.env.UPSTREAM_BASE_URL || process.env.MINIMAX_BASE_URL ||
 const authHeader = (process.env.UPSTREAM_AUTH_HEADER || (provider === 'deepseek' ? 'x-api-key' : 'authorization')).toLowerCase();
 const apiFormat = (process.env.UPSTREAM_API_FORMAT || 'anthropic').toLowerCase();
 const normalizedApiFormat = apiFormat === 'openai' ? 'openai-chat' : apiFormat;
+const maxTokensLimit = Number(process.env.UPSTREAM_MAX_TOKENS || (provider === 'vllm' ? '4096' : '0'));
 
 if (!apiKey) {
   console.error('UPSTREAM_API_KEY is required');
@@ -1760,7 +1764,7 @@ function anthropicToOpenAI(body) {
   };
 
   if (typeof body.max_tokens === 'number') {
-    openAIRequest.max_tokens = body.max_tokens;
+    openAIRequest.max_tokens = maxTokensLimit > 0 ? Math.min(body.max_tokens, maxTokensLimit) : body.max_tokens;
   }
   if (typeof body.temperature === 'number') {
     openAIRequest.temperature = body.temperature;
@@ -2124,9 +2128,10 @@ PORT=${port}
 EOF_ENV
   chmod 600 "$PROXY_ENV"
 
-  cat > "$PROXY_LAUNCHER" <<EOF_LAUNCHER
+cat > "$PROXY_LAUNCHER" <<EOF_LAUNCHER
 #!/usr/bin/env bash
 set -euo pipefail
+export PATH="${USER_BIN_DIR}:\${PATH}"
 set -a
 . "${PROXY_ENV}"
 set +a
