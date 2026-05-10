@@ -14,6 +14,9 @@ CODEX_ENV="${CODEX_ROUTER_DIR}/codex.env"
 CODEX_PROXY_DIR="${HOME}/.local/share/agent-router-codex-proxy"
 CODEX_PROXY_BIN="${CODEX_PROXY_DIR}/proxy.js"
 CODEX_PROXY_ENV="${CODEX_PROXY_DIR}/proxy.env"
+ROUTER_STATE_DIR="${HOME}/.local/share/agent-router"
+CLAUDE_MODEL_HISTORY="${ROUTER_STATE_DIR}/claude-models.tsv"
+CODEX_MODEL_HISTORY="${CODEX_ROUTER_DIR}/models.tsv"
 USER_BIN_DIR="${HOME}/.local/bin"
 NODE_ROOT="${HOME}/.local/share/agent-router-node"
 NODE_VERSION="${AGENT_ROUTER_NODE_VERSION:-20.18.1}"
@@ -153,6 +156,89 @@ tty_say() {
   printf '%s\n' "$*" >/dev/tty
 }
 
+append_model_if_missing() {
+  local -n models_ref="$1"
+  local candidate="${2:-}"
+  local existing
+
+  [ -n "$candidate" ] || return 0
+  for existing in "${models_ref[@]}"; do
+    [ "$existing" = "$candidate" ] && return 0
+  done
+  models_ref+=("$candidate")
+}
+
+model_history_candidates() {
+  local file="${1:-}"
+  local provider="${2:-}"
+  local kind="${3:-}"
+
+  [ -n "$file" ] && [ -f "$file" ] || return 0
+  awk -F '\t' -v provider="$provider" -v kind="$kind" '
+    NF >= 3 { p = $1; k = $2; model = $3 }
+    NF == 2 { p = $1; k = ""; model = $2 }
+    NF == 1 { p = ""; k = ""; model = $1 }
+    model != "" &&
+      (provider == "" || p == "" || p == provider) &&
+      (kind == "" || k == "" || k == kind || k == "primary" || kind == "primary") {
+        if (!seen[model]++) print model
+      }
+  ' "$file"
+}
+
+record_model_history() {
+  local file="$1"
+  local provider="$2"
+  local kind="$3"
+  local model="$4"
+  local dir
+  local tmp
+
+  [ -n "$model" ] || return 0
+  dir="$(dirname "$file")"
+  mkdir -p "$dir"
+  chmod 700 "$dir"
+  tmp="$(mktemp "${dir}/models.XXXXXX")"
+
+  printf '%s\t%s\t%s\n' "$provider" "$kind" "$model" > "$tmp"
+  if [ -f "$file" ]; then
+    awk -F '\t' -v provider="$provider" -v kind="$kind" -v model="$model" '
+      BEGIN { count = 1 }
+      $0 == "" { next }
+      {
+        p = ""; k = ""; m = ""
+        if (NF >= 3) { p = $1; k = $2; m = $3 }
+        else if (NF == 2) { p = $1; m = $2 }
+        else { m = $1 }
+        key = p "\t" k "\t" m
+        if (p == provider && k == kind && m == model) next
+        if (m != "" && !seen[key]++ && count < 200) {
+          print $0
+          count++
+        }
+      }
+    ' "$file" >> "$tmp"
+  fi
+
+  mv "$tmp" "$file"
+  chmod 600 "$file"
+}
+
+claude_configured_models() {
+  local file
+
+  for file in "$SETTINGS_FILE" "$SETTINGS_FILE".backup.*; do
+    [ -f "$file" ] || continue
+    awk '
+      /"ANTHROPIC_MODEL"|"ANTHROPIC_SMALL_FAST_MODEL"|"ANTHROPIC_DEFAULT_SONNET_MODEL"|"ANTHROPIC_DEFAULT_OPUS_MODEL"|"ANTHROPIC_DEFAULT_HAIKU_MODEL"|"CLAUDE_CODE_SUBAGENT_MODEL"/ {
+        sub(/^[^:]*:[[:space:]]*"/, "")
+        sub(/",?[[:space:]]*$/, "")
+        if ($0 != "") print
+      }
+    ' "$file"
+  done
+}
+
 model_note() {
   local model="$1"
 
@@ -193,6 +279,7 @@ select_model_menu() {
   local choice
   local custom_choice
   local default_choice=1
+  local history_model
 
   case "${provider}:${kind}" in
     minimax:primary|minimax:small)
@@ -236,6 +323,18 @@ select_model_menu() {
       return
       ;;
   esac
+
+  if [ -n "${AGENT_ROUTER_MODEL_HISTORY_FILE:-}" ]; then
+    while IFS= read -r history_model; do
+      append_model_if_missing models "$history_model"
+    done < <(model_history_candidates "$AGENT_ROUTER_MODEL_HISTORY_FILE" "${AGENT_ROUTER_MODEL_HISTORY_PROVIDER:-$provider}" "${AGENT_ROUTER_MODEL_HISTORY_KIND:-$kind}")
+  fi
+  if [ "${AGENT_ROUTER_INCLUDE_CLAUDE_CONFIG_HISTORY:-0}" = "1" ] && declare -F claude_configured_models >/dev/null; then
+    while IFS= read -r history_model; do
+      append_model_if_missing models "$history_model"
+    done < <(claude_configured_models)
+  fi
+  append_model_if_missing models "$default_model"
 
   custom_choice=$((${#models[@]} + 1))
   for i in "${!models[@]}"; do
@@ -358,9 +457,29 @@ select_openai_model_from_base_url() {
   local base_url="$1"
   local fallback_model="${2:-}"
   local api_key="${3:-}"
+  local history_file="${4:-${AGENT_ROUTER_MODEL_HISTORY_FILE:-}}"
+  local history_provider="${5:-${AGENT_ROUTER_MODEL_HISTORY_PROVIDER:-}}"
   local model_lines
   local models=()
+  local history_models=()
   local model
+  local history_model
+
+  if [ -n "$history_file" ]; then
+    while IFS= read -r history_model; do
+      append_model_if_missing history_models "$history_model"
+    done < <(model_history_candidates "$history_file" "$history_provider" "primary")
+  fi
+  if [ "${AGENT_ROUTER_INCLUDE_CLAUDE_CONFIG_HISTORY:-0}" = "1" ] && declare -F claude_configured_models >/dev/null; then
+    while IFS= read -r history_model; do
+      append_model_if_missing history_models "$history_model"
+    done < <(claude_configured_models)
+  fi
+  if [ "${AGENT_ROUTER_INCLUDE_CODEX_CONFIG_HISTORY:-0}" = "1" ] && declare -F codex_configured_models >/dev/null; then
+    while IFS= read -r history_model; do
+      append_model_if_missing history_models "$history_model"
+    done < <(codex_configured_models)
+  fi
 
   tty_say "Checking models from ${base_url%/}/models..."
   if model_lines="$(discover_openai_models "$base_url" "$api_key")" && [ -n "$model_lines" ]; then
@@ -369,13 +488,20 @@ select_openai_model_from_base_url() {
     done <<< "$model_lines"
 
     if [ "${#models[@]}" -gt 0 ]; then
-      AGENT_ROUTER_DEFAULT_MODEL="$fallback_model" select_discovered_model_menu "Discovered models" "${models[@]}"
+      for history_model in "${history_models[@]}"; do
+        append_model_if_missing models "$history_model"
+      done
+      append_model_if_missing models "$fallback_model"
+      AGENT_ROUTER_DEFAULT_MODEL="$fallback_model" select_discovered_model_menu "Available models" "${models[@]}"
       return
     fi
   fi
 
   tty_say "Could not discover models from ${base_url%/}/models."
-  if [ -n "$fallback_model" ]; then
+  append_model_if_missing history_models "$fallback_model"
+  if [ "${#history_models[@]}" -gt 0 ]; then
+    AGENT_ROUTER_DEFAULT_MODEL="$fallback_model" select_discovered_model_menu "Previously configured models" "${history_models[@]}"
+  elif [ -n "$fallback_model" ]; then
     printf '%s' "$(prompt_default 'Model name' "$fallback_model")"
   else
     printf '%s' "$(prompt_required 'Model name')"
@@ -1745,6 +1871,24 @@ codex_config_provider_value() {
   ' "$CODEX_CONFIG_FILE"
 }
 
+codex_configured_models() {
+  local file
+
+  for file in "$CODEX_CONFIG_FILE" "$CODEX_CONFIG_FILE".backup.*; do
+    [ -f "$file" ] || continue
+    awk '
+      /^[[:space:]]*\[/ { in_root = 0 }
+      BEGIN { in_root = 1 }
+      in_root && /^[[:space:]]*model[[:space:]]*=/ {
+        sub(/^[^=]*=[[:space:]]*/, "")
+        gsub(/^"|"$/, "")
+        if ($0 != "") print
+        exit
+      }
+    ' "$file"
+  done
+}
+
 codex_current_upstream_base_url() {
   local base_url
   base_url="$(env_file_value "$CODEX_PROXY_ENV" UPSTREAM_BASE_URL || true)"
@@ -1774,6 +1918,7 @@ codex_provider_from_base_url() {
     *deepseek*) printf '%s' "deepseek" ;;
     *bigmodel*|*z.ai*|*zhipu*) printf '%s' "zhipu" ;;
     *moonshot*|*kimi*) printf '%s' "kimi" ;;
+    *xiaomimimo*|*mimo.mi.com*) printf '%s' "mimo" ;;
     *minimaxi*|*minimax*) printf '%s' "minimax" ;;
     *openai.com*) printf '%s' "openai" ;;
     *) printf '%s' "custom" ;;
@@ -1828,6 +1973,19 @@ select_codex_model_menu() {
   local choice
   local custom_choice
   local default_choice=1
+  local history_model
+
+  if [ -n "${AGENT_ROUTER_MODEL_HISTORY_FILE:-}" ]; then
+    while IFS= read -r history_model; do
+      append_model_if_missing models "$history_model"
+    done < <(model_history_candidates "$AGENT_ROUTER_MODEL_HISTORY_FILE" "${AGENT_ROUTER_MODEL_HISTORY_PROVIDER:-}" "primary")
+  fi
+  if [ "${AGENT_ROUTER_INCLUDE_CODEX_CONFIG_HISTORY:-0}" = "1" ] && declare -F codex_configured_models >/dev/null; then
+    while IFS= read -r history_model; do
+      append_model_if_missing models "$history_model"
+    done < <(codex_configured_models)
+  fi
+  append_model_if_missing models "$default_model"
 
   custom_choice=$((${#models[@]} + 1))
   for i in "${!models[@]}"; do
@@ -2010,7 +2168,8 @@ configure_codex_provider() {
     deepseek) default_provider_choice="2" ;;
     zhipu) default_provider_choice="3" ;;
     kimi) default_provider_choice="4" ;;
-    custom|openai) default_provider_choice="5" ;;
+    mimo) default_provider_choice="5" ;;
+    custom|openai) default_provider_choice="6" ;;
   esac
 
   say "Choose Codex upstream provider:"
@@ -2018,7 +2177,8 @@ configure_codex_provider() {
   say "  2) DeepSeek"
   say "  3) Zhipu GLM"
   say "  4) Kimi / Moonshot"
-  say "  5) Custom OpenAI-compatible / vLLM"
+  say "  5) Xiaomi MiMo"
+  say "  6) Custom OpenAI-compatible / vLLM"
   provider_choice="$(prompt_default 'Provider choice' "$default_provider_choice")"
 
   local provider
@@ -2047,6 +2207,14 @@ configure_codex_provider() {
       say "Kimi OpenAI-compatible endpoint: ${base_url}"
       ;;
     5)
+      provider="mimo"
+      provider_label="Xiaomi MiMo"
+      base_url="https://api.xiaomimimo.com/v1"
+      [ "$current_provider" = "$provider" ] || default_model="mimo-v2.5-pro"
+      say "Xiaomi MiMo website: https://mimo.mi.com/"
+      say "Xiaomi MiMo OpenAI-compatible endpoint: ${base_url}"
+      ;;
+    6)
       provider="custom"
       provider_label="Custom OpenAI-compatible"
       local default_base_url="${current_base_url:-http://127.0.0.1:8000/v1}"
@@ -2087,7 +2255,7 @@ configure_codex_provider() {
   fi
 
   local model
-  model="$(select_openai_model_from_base_url "$base_url" "$default_model" "$api_key")"
+  model="$(AGENT_ROUTER_MODEL_HISTORY_FILE="$CODEX_MODEL_HISTORY" AGENT_ROUTER_MODEL_HISTORY_PROVIDER="$provider" AGENT_ROUTER_INCLUDE_CODEX_CONFIG_HISTORY=1 select_openai_model_from_base_url "$base_url" "$default_model" "$api_key")"
 
   local api_format
   api_format="$(codex_base_url_api_format "$base_url")"
@@ -2113,6 +2281,7 @@ configure_codex_provider() {
   else
     write_codex_config "$base_url" "$model" "$provider_name" "$reasoning_effort"
   fi
+  record_model_history "$CODEX_MODEL_HISTORY" "$provider" "primary" "$model"
 }
 
 remove_legacy_codex_switchers() {
@@ -2140,6 +2309,8 @@ SETTINGS_FILE="${CLAUDE_DIR}/settings.json"
 PROXY_DIR="${HOME}/.local/share/agent-router-proxy"
 PROXY_BIN="${PROXY_DIR}/proxy.js"
 PROXY_ENV="${PROXY_DIR}/proxy.env"
+ROUTER_STATE_DIR="${HOME}/.local/share/agent-router"
+CLAUDE_MODEL_HISTORY="${ROUTER_STATE_DIR}/claude-models.tsv"
 USER_BIN_DIR="${HOME}/.local/bin"
 PROXY_LAUNCHER="${USER_BIN_DIR}/agent-router-proxy"
 SERVICE_FILE="${HOME}/.config/systemd/user/agent-router-proxy.service"
@@ -2223,6 +2394,89 @@ tty_say() {
   printf '%s\n' "$*" >/dev/tty
 }
 
+append_model_if_missing() {
+  local -n models_ref="$1"
+  local candidate="${2:-}"
+  local existing
+
+  [ -n "$candidate" ] || return 0
+  for existing in "${models_ref[@]}"; do
+    [ "$existing" = "$candidate" ] && return 0
+  done
+  models_ref+=("$candidate")
+}
+
+model_history_candidates() {
+  local file="${1:-}"
+  local provider="${2:-}"
+  local kind="${3:-}"
+
+  [ -n "$file" ] && [ -f "$file" ] || return 0
+  awk -F '\t' -v provider="$provider" -v kind="$kind" '
+    NF >= 3 { p = $1; k = $2; model = $3 }
+    NF == 2 { p = $1; k = ""; model = $2 }
+    NF == 1 { p = ""; k = ""; model = $1 }
+    model != "" &&
+      (provider == "" || p == "" || p == provider) &&
+      (kind == "" || k == "" || k == kind || k == "primary" || kind == "primary") {
+        if (!seen[model]++) print model
+      }
+  ' "$file"
+}
+
+record_model_history() {
+  local file="$1"
+  local provider="$2"
+  local kind="$3"
+  local model="$4"
+  local dir
+  local tmp
+
+  [ -n "$model" ] || return 0
+  dir="$(dirname "$file")"
+  mkdir -p "$dir"
+  chmod 700 "$dir"
+  tmp="$(mktemp "${dir}/models.XXXXXX")"
+
+  printf '%s\t%s\t%s\n' "$provider" "$kind" "$model" > "$tmp"
+  if [ -f "$file" ]; then
+    awk -F '\t' -v provider="$provider" -v kind="$kind" -v model="$model" '
+      BEGIN { count = 1 }
+      $0 == "" { next }
+      {
+        p = ""; k = ""; m = ""
+        if (NF >= 3) { p = $1; k = $2; m = $3 }
+        else if (NF == 2) { p = $1; m = $2 }
+        else { m = $1 }
+        key = p "\t" k "\t" m
+        if (p == provider && k == kind && m == model) next
+        if (m != "" && !seen[key]++ && count < 200) {
+          print $0
+          count++
+        }
+      }
+    ' "$file" >> "$tmp"
+  fi
+
+  mv "$tmp" "$file"
+  chmod 600 "$file"
+}
+
+claude_configured_models() {
+  local file
+
+  for file in "$SETTINGS_FILE" "$SETTINGS_FILE".backup.*; do
+    [ -f "$file" ] || continue
+    awk '
+      /"ANTHROPIC_MODEL"|"ANTHROPIC_SMALL_FAST_MODEL"|"ANTHROPIC_DEFAULT_SONNET_MODEL"|"ANTHROPIC_DEFAULT_OPUS_MODEL"|"ANTHROPIC_DEFAULT_HAIKU_MODEL"|"CLAUDE_CODE_SUBAGENT_MODEL"/ {
+        sub(/^[^:]*:[[:space:]]*"/, "")
+        sub(/",?[[:space:]]*$/, "")
+        if ($0 != "") print
+      }
+    ' "$file"
+  done
+}
+
 model_note() {
   local model="$1"
 
@@ -2263,6 +2517,7 @@ select_model_menu() {
   local choice
   local custom_choice
   local default_choice=1
+  local history_model
 
   case "${provider}:${kind}" in
     minimax:primary|minimax:small)
@@ -2306,6 +2561,18 @@ select_model_menu() {
       return
       ;;
   esac
+
+  if [ -n "${AGENT_ROUTER_MODEL_HISTORY_FILE:-}" ]; then
+    while IFS= read -r history_model; do
+      append_model_if_missing models "$history_model"
+    done < <(model_history_candidates "$AGENT_ROUTER_MODEL_HISTORY_FILE" "${AGENT_ROUTER_MODEL_HISTORY_PROVIDER:-$provider}" "${AGENT_ROUTER_MODEL_HISTORY_KIND:-$kind}")
+  fi
+  if [ "${AGENT_ROUTER_INCLUDE_CLAUDE_CONFIG_HISTORY:-0}" = "1" ] && declare -F claude_configured_models >/dev/null; then
+    while IFS= read -r history_model; do
+      append_model_if_missing models "$history_model"
+    done < <(claude_configured_models)
+  fi
+  append_model_if_missing models "$default_model"
 
   custom_choice=$((${#models[@]} + 1))
   for i in "${!models[@]}"; do
@@ -2428,9 +2695,29 @@ select_openai_model_from_base_url() {
   local base_url="$1"
   local fallback_model="${2:-}"
   local api_key="${3:-}"
+  local history_file="${4:-${AGENT_ROUTER_MODEL_HISTORY_FILE:-}}"
+  local history_provider="${5:-${AGENT_ROUTER_MODEL_HISTORY_PROVIDER:-}}"
   local model_lines
   local models=()
+  local history_models=()
   local model
+  local history_model
+
+  if [ -n "$history_file" ]; then
+    while IFS= read -r history_model; do
+      append_model_if_missing history_models "$history_model"
+    done < <(model_history_candidates "$history_file" "$history_provider" "primary")
+  fi
+  if [ "${AGENT_ROUTER_INCLUDE_CLAUDE_CONFIG_HISTORY:-0}" = "1" ] && declare -F claude_configured_models >/dev/null; then
+    while IFS= read -r history_model; do
+      append_model_if_missing history_models "$history_model"
+    done < <(claude_configured_models)
+  fi
+  if [ "${AGENT_ROUTER_INCLUDE_CODEX_CONFIG_HISTORY:-0}" = "1" ] && declare -F codex_configured_models >/dev/null; then
+    while IFS= read -r history_model; do
+      append_model_if_missing history_models "$history_model"
+    done < <(codex_configured_models)
+  fi
 
   tty_say "Checking models from ${base_url%/}/models..."
   if model_lines="$(discover_openai_models "$base_url" "$api_key")" && [ -n "$model_lines" ]; then
@@ -2439,13 +2726,20 @@ select_openai_model_from_base_url() {
     done <<< "$model_lines"
 
     if [ "${#models[@]}" -gt 0 ]; then
-      AGENT_ROUTER_DEFAULT_MODEL="$fallback_model" select_discovered_model_menu "Discovered models" "${models[@]}"
+      for history_model in "${history_models[@]}"; do
+        append_model_if_missing models "$history_model"
+      done
+      append_model_if_missing models "$fallback_model"
+      AGENT_ROUTER_DEFAULT_MODEL="$fallback_model" select_discovered_model_menu "Available models" "${models[@]}"
       return
     fi
   fi
 
   tty_say "Could not discover models from ${base_url%/}/models."
-  if [ -n "$fallback_model" ]; then
+  append_model_if_missing history_models "$fallback_model"
+  if [ "${#history_models[@]}" -gt 0 ]; then
+    AGENT_ROUTER_DEFAULT_MODEL="$fallback_model" select_discovered_model_menu "Previously configured models" "${history_models[@]}"
+  elif [ -n "$fallback_model" ]; then
     printf '%s' "$(prompt_default 'Model name' "$fallback_model")"
   else
     printf '%s' "$(prompt_required 'Model name')"
@@ -2505,6 +2799,7 @@ current_provider() {
     *deepseek*) printf '%s' "deepseek" ;;
     *bigmodel*|*z.ai*|*zhipu*) printf '%s' "zhipu" ;;
     *moonshot*|*kimi*) printf '%s' "kimi" ;;
+    *xiaomimimo*|*mimo.mi.com*) printf '%s' "mimo" ;;
     *vllm*) printf '%s' "vllm" ;;
     *minimax*|*minimaxi*) printf '%s' "minimax" ;;
     *) return 1 ;;
@@ -3695,7 +3990,8 @@ main() {
   say "  2) DeepSeek V4"
   say "  3) Zhipu GLM"
   say "  4) Kimi"
-  say "  5) Custom OpenAI-compatible / vLLM"
+  say "  5) Xiaomi MiMo"
+  say "  6) Custom OpenAI-compatible / vLLM"
   local provider_choice
   provider_choice="$(prompt_default 'Provider choice' '1')"
 
@@ -3743,6 +4039,17 @@ main() {
       say "Kimi Anthropic endpoint: ${base_url}"
       ;;
     5)
+      provider="mimo"
+      provider_label="Xiaomi MiMo"
+      auth_header="authorization"
+      default_model="mimo-v2.5-pro"
+      default_small_model="$default_model"
+      api_format="openai-chat"
+      base_url="https://api.xiaomimimo.com/v1"
+      say "Xiaomi MiMo website: https://mimo.mi.com/"
+      say "Xiaomi MiMo OpenAI-compatible endpoint: ${base_url}"
+      ;;
+    6)
       provider="vllm"
       provider_label="Custom OpenAI-compatible"
       auth_header="authorization"
@@ -3812,16 +4119,16 @@ main() {
 
   local model
   if [ "$api_format" = "openai-chat" ]; then
-    model="$(select_openai_model_from_base_url "$base_url" "$default_model" "$api_key")"
+    model="$(AGENT_ROUTER_MODEL_HISTORY_FILE="$CLAUDE_MODEL_HISTORY" AGENT_ROUTER_MODEL_HISTORY_PROVIDER="$provider" AGENT_ROUTER_INCLUDE_CLAUDE_CONFIG_HISTORY=1 select_openai_model_from_base_url "$base_url" "$default_model" "$api_key")"
   else
-    model="$(select_model_menu "$provider" "primary" "$default_model" "Primary model")"
+    model="$(AGENT_ROUTER_MODEL_HISTORY_FILE="$CLAUDE_MODEL_HISTORY" AGENT_ROUTER_MODEL_HISTORY_PROVIDER="$provider" AGENT_ROUTER_INCLUDE_CLAUDE_CONFIG_HISTORY=1 select_model_menu "$provider" "primary" "$default_model" "Primary model")"
   fi
 
   local small_model
   if [ "$api_format" = "openai-chat" ]; then
     small_model="$model"
   elif [ "$provider" = "deepseek" ]; then
-    small_model="$(select_model_menu "$provider" "small" "$default_small_model" "Small/haiku model")"
+    small_model="$(AGENT_ROUTER_MODEL_HISTORY_FILE="$CLAUDE_MODEL_HISTORY" AGENT_ROUTER_MODEL_HISTORY_PROVIDER="$provider" AGENT_ROUTER_INCLUDE_CLAUDE_CONFIG_HISTORY=1 select_model_menu "$provider" "small" "$default_small_model" "Small/haiku model")"
   else
     small_model="$model"
   fi
@@ -3856,6 +4163,8 @@ main() {
     fi
   fi
 
+  record_model_history "$CLAUDE_MODEL_HISTORY" "$provider" "primary" "$model"
+  record_model_history "$CLAUDE_MODEL_HISTORY" "$provider" "small" "$small_model"
   say
   say "Done. Open Claude Code again for the new provider/model to take effect."
 }
@@ -3965,6 +4274,7 @@ CODEX_DIR="${HOME}/.codex"
 CODEX_CONFIG_FILE="${CODEX_DIR}/config.toml"
 CODEX_ROUTER_DIR="${HOME}/.local/share/agent-router-codex"
 CODEX_ENV="${CODEX_ROUTER_DIR}/codex.env"
+CODEX_MODEL_HISTORY="${CODEX_ROUTER_DIR}/models.tsv"
 USER_BIN_DIR="${HOME}/.local/bin"
 CODEX_TOKEN_HELPER="${USER_BIN_DIR}/agent-router-codex-token"
 CODEX_PROXY_DIR="${HOME}/.local/share/agent-router-codex-proxy"
@@ -4050,6 +4360,74 @@ prompt_required() {
 
 tty_say() {
   printf '%s\n' "$*" >/dev/tty
+}
+
+append_model_if_missing() {
+  local -n models_ref="$1"
+  local candidate="${2:-}"
+  local existing
+
+  [ -n "$candidate" ] || return 0
+  for existing in "${models_ref[@]}"; do
+    [ "$existing" = "$candidate" ] && return 0
+  done
+  models_ref+=("$candidate")
+}
+
+model_history_candidates() {
+  local file="${1:-}"
+  local provider="${2:-}"
+  local kind="${3:-}"
+
+  [ -n "$file" ] && [ -f "$file" ] || return 0
+  awk -F '\t' -v provider="$provider" -v kind="$kind" '
+    NF >= 3 { p = $1; k = $2; model = $3 }
+    NF == 2 { p = $1; k = ""; model = $2 }
+    NF == 1 { p = ""; k = ""; model = $1 }
+    model != "" &&
+      (provider == "" || p == "" || p == provider) &&
+      (kind == "" || k == "" || k == kind || k == "primary" || kind == "primary") {
+        if (!seen[model]++) print model
+      }
+  ' "$file"
+}
+
+record_model_history() {
+  local file="$1"
+  local provider="$2"
+  local kind="$3"
+  local model="$4"
+  local dir
+  local tmp
+
+  [ -n "$model" ] || return 0
+  dir="$(dirname "$file")"
+  mkdir -p "$dir"
+  chmod 700 "$dir"
+  tmp="$(mktemp "${dir}/models.XXXXXX")"
+
+  printf '%s\t%s\t%s\n' "$provider" "$kind" "$model" > "$tmp"
+  if [ -f "$file" ]; then
+    awk -F '\t' -v provider="$provider" -v kind="$kind" -v model="$model" '
+      BEGIN { count = 1 }
+      $0 == "" { next }
+      {
+        p = ""; k = ""; m = ""
+        if (NF >= 3) { p = $1; k = $2; m = $3 }
+        else if (NF == 2) { p = $1; m = $2 }
+        else { m = $1 }
+        key = p "\t" k "\t" m
+        if (p == provider && k == kind && m == model) next
+        if (m != "" && !seen[key]++ && count < 200) {
+          print $0
+          count++
+        }
+      }
+    ' "$file" >> "$tmp"
+  fi
+
+  mv "$tmp" "$file"
+  chmod 600 "$file"
 }
 
 confirm() {
@@ -4161,9 +4539,29 @@ select_openai_model_from_base_url() {
   local base_url="$1"
   local fallback_model="${2:-}"
   local api_key="${3:-}"
+  local history_file="${4:-${AGENT_ROUTER_MODEL_HISTORY_FILE:-}}"
+  local history_provider="${5:-${AGENT_ROUTER_MODEL_HISTORY_PROVIDER:-}}"
   local model_lines
   local models=()
+  local history_models=()
   local model
+  local history_model
+
+  if [ -n "$history_file" ]; then
+    while IFS= read -r history_model; do
+      append_model_if_missing history_models "$history_model"
+    done < <(model_history_candidates "$history_file" "$history_provider" "primary")
+  fi
+  if [ "${AGENT_ROUTER_INCLUDE_CLAUDE_CONFIG_HISTORY:-0}" = "1" ] && declare -F claude_configured_models >/dev/null; then
+    while IFS= read -r history_model; do
+      append_model_if_missing history_models "$history_model"
+    done < <(claude_configured_models)
+  fi
+  if [ "${AGENT_ROUTER_INCLUDE_CODEX_CONFIG_HISTORY:-0}" = "1" ] && declare -F codex_configured_models >/dev/null; then
+    while IFS= read -r history_model; do
+      append_model_if_missing history_models "$history_model"
+    done < <(codex_configured_models)
+  fi
 
   tty_say "Checking models from ${base_url%/}/models..."
   if model_lines="$(discover_openai_models "$base_url" "$api_key")" && [ -n "$model_lines" ]; then
@@ -4172,13 +4570,20 @@ select_openai_model_from_base_url() {
     done <<< "$model_lines"
 
     if [ "${#models[@]}" -gt 0 ]; then
-      AGENT_ROUTER_DEFAULT_MODEL="$fallback_model" select_discovered_model_menu "Discovered models" "${models[@]}"
+      for history_model in "${history_models[@]}"; do
+        append_model_if_missing models "$history_model"
+      done
+      append_model_if_missing models "$fallback_model"
+      AGENT_ROUTER_DEFAULT_MODEL="$fallback_model" select_discovered_model_menu "Available models" "${models[@]}"
       return
     fi
   fi
 
   tty_say "Could not discover models from ${base_url%/}/models."
-  if [ -n "$fallback_model" ]; then
+  append_model_if_missing history_models "$fallback_model"
+  if [ "${#history_models[@]}" -gt 0 ]; then
+    AGENT_ROUTER_DEFAULT_MODEL="$fallback_model" select_discovered_model_menu "Previously configured models" "${history_models[@]}"
+  elif [ -n "$fallback_model" ]; then
     printf '%s' "$(prompt_default 'Model name' "$fallback_model")"
   else
     printf '%s' "$(prompt_required 'Model name')"
@@ -4222,6 +4627,24 @@ codex_config_provider_value() {
   ' "$CODEX_CONFIG_FILE"
 }
 
+codex_configured_models() {
+  local file
+
+  for file in "$CODEX_CONFIG_FILE" "$CODEX_CONFIG_FILE".backup.*; do
+    [ -f "$file" ] || continue
+    awk '
+      /^[[:space:]]*\[/ { in_root = 0 }
+      BEGIN { in_root = 1 }
+      in_root && /^[[:space:]]*model[[:space:]]*=/ {
+        sub(/^[^=]*=[[:space:]]*/, "")
+        gsub(/^"|"$/, "")
+        if ($0 != "") print
+        exit
+      }
+    ' "$file"
+  done
+}
+
 codex_current_upstream_base_url() {
   local base_url
   base_url="$(env_file_value "$CODEX_PROXY_ENV" UPSTREAM_BASE_URL || true)"
@@ -4251,6 +4674,7 @@ codex_provider_from_base_url() {
     *deepseek*) printf '%s' "deepseek" ;;
     *bigmodel*|*z.ai*|*zhipu*) printf '%s' "zhipu" ;;
     *moonshot*|*kimi*) printf '%s' "kimi" ;;
+    *xiaomimimo*|*mimo.mi.com*) printf '%s' "mimo" ;;
     *minimaxi*|*minimax*) printf '%s' "minimax" ;;
     *openai.com*) printf '%s' "openai" ;;
     *) printf '%s' "custom" ;;
@@ -4305,6 +4729,19 @@ select_codex_model_menu() {
   local choice
   local custom_choice
   local default_choice=1
+  local history_model
+
+  if [ -n "${AGENT_ROUTER_MODEL_HISTORY_FILE:-}" ]; then
+    while IFS= read -r history_model; do
+      append_model_if_missing models "$history_model"
+    done < <(model_history_candidates "$AGENT_ROUTER_MODEL_HISTORY_FILE" "${AGENT_ROUTER_MODEL_HISTORY_PROVIDER:-}" "primary")
+  fi
+  if [ "${AGENT_ROUTER_INCLUDE_CODEX_CONFIG_HISTORY:-0}" = "1" ] && declare -F codex_configured_models >/dev/null; then
+    while IFS= read -r history_model; do
+      append_model_if_missing models "$history_model"
+    done < <(codex_configured_models)
+  fi
+  append_model_if_missing models "$default_model"
 
   custom_choice=$((${#models[@]} + 1))
   for i in "${!models[@]}"; do
@@ -4535,7 +4972,8 @@ main() {
     deepseek) default_provider_choice="2" ;;
     zhipu) default_provider_choice="3" ;;
     kimi) default_provider_choice="4" ;;
-    custom|openai) default_provider_choice="5" ;;
+    mimo) default_provider_choice="5" ;;
+    custom|openai) default_provider_choice="6" ;;
   esac
 
   say "Choose Codex upstream provider:"
@@ -4543,7 +4981,8 @@ main() {
   say "  2) DeepSeek"
   say "  3) Zhipu GLM"
   say "  4) Kimi / Moonshot"
-  say "  5) Custom OpenAI-compatible / vLLM"
+  say "  5) Xiaomi MiMo"
+  say "  6) Custom OpenAI-compatible / vLLM"
   provider_choice="$(prompt_default 'Provider choice' "$default_provider_choice")"
 
   local provider
@@ -4572,6 +5011,14 @@ main() {
       say "Kimi OpenAI-compatible endpoint: ${base_url}"
       ;;
     5)
+      provider="mimo"
+      provider_label="Xiaomi MiMo"
+      base_url="https://api.xiaomimimo.com/v1"
+      [ "$current_provider" = "$provider" ] || default_model="mimo-v2.5-pro"
+      say "Xiaomi MiMo website: https://mimo.mi.com/"
+      say "Xiaomi MiMo OpenAI-compatible endpoint: ${base_url}"
+      ;;
+    6)
       provider="custom"
       provider_label="Custom OpenAI-compatible"
       local default_base_url="${current_base_url:-http://127.0.0.1:8000/v1}"
@@ -4612,7 +5059,7 @@ main() {
   fi
 
   local model
-  model="$(select_openai_model_from_base_url "$base_url" "$default_model" "$api_key")"
+  model="$(AGENT_ROUTER_MODEL_HISTORY_FILE="$CODEX_MODEL_HISTORY" AGENT_ROUTER_MODEL_HISTORY_PROVIDER="$provider" AGENT_ROUTER_INCLUDE_CODEX_CONFIG_HISTORY=1 select_openai_model_from_base_url "$base_url" "$default_model" "$api_key")"
 
   local api_format
   api_format="$(codex_base_url_api_format "$base_url")"
@@ -4638,6 +5085,7 @@ main() {
   else
     write_codex_config "$base_url" "$model" "$provider_name" "$reasoning_effort"
   fi
+  record_model_history "$CODEX_MODEL_HISTORY" "$provider" "primary" "$model"
 
   say
   say "Done. Open Codex again for the new provider/model to take effect."
@@ -4661,7 +5109,8 @@ run_claude_setup() {
   say "  2) DeepSeek V4"
   say "  3) Zhipu GLM"
   say "  4) Kimi"
-  say "  5) Custom OpenAI-compatible / vLLM"
+  say "  5) Xiaomi MiMo"
+  say "  6) Custom OpenAI-compatible / vLLM"
   local provider_choice
   provider_choice="$(prompt_default 'Provider choice' '1')"
 
@@ -4709,6 +5158,17 @@ run_claude_setup() {
       say "Kimi Anthropic endpoint: ${base_url}"
       ;;
     5)
+      provider="mimo"
+      provider_label="Xiaomi MiMo"
+      auth_header="authorization"
+      default_model="mimo-v2.5-pro"
+      default_small_model="$default_model"
+      api_format="openai-chat"
+      base_url="https://api.xiaomimimo.com/v1"
+      say "Xiaomi MiMo website: https://mimo.mi.com/"
+      say "Xiaomi MiMo OpenAI-compatible endpoint: ${base_url}"
+      ;;
+    6)
       provider="vllm"
       provider_label="Custom OpenAI-compatible"
       auth_header="authorization"
@@ -4748,16 +5208,16 @@ run_claude_setup() {
 
   local model
   if [ "$api_format" = "openai-chat" ]; then
-    model="$(select_openai_model_from_base_url "$base_url" "$default_model" "$api_key")"
+    model="$(AGENT_ROUTER_MODEL_HISTORY_FILE="$CLAUDE_MODEL_HISTORY" AGENT_ROUTER_MODEL_HISTORY_PROVIDER="$provider" AGENT_ROUTER_INCLUDE_CLAUDE_CONFIG_HISTORY=1 select_openai_model_from_base_url "$base_url" "$default_model" "$api_key")"
   else
-    model="$(select_model_menu "$provider" "primary" "$default_model" "Primary model")"
+    model="$(AGENT_ROUTER_MODEL_HISTORY_FILE="$CLAUDE_MODEL_HISTORY" AGENT_ROUTER_MODEL_HISTORY_PROVIDER="$provider" AGENT_ROUTER_INCLUDE_CLAUDE_CONFIG_HISTORY=1 select_model_menu "$provider" "primary" "$default_model" "Primary model")"
   fi
 
   local small_model
   if [ "$api_format" = "openai-chat" ]; then
     small_model="$model"
   elif [ "$provider" = "deepseek" ]; then
-    small_model="$(select_model_menu "$provider" "small" "$default_small_model" "Small/haiku model")"
+    small_model="$(AGENT_ROUTER_MODEL_HISTORY_FILE="$CLAUDE_MODEL_HISTORY" AGENT_ROUTER_MODEL_HISTORY_PROVIDER="$provider" AGENT_ROUTER_INCLUDE_CLAUDE_CONFIG_HISTORY=1 select_model_menu "$provider" "small" "$default_small_model" "Small/haiku model")"
   else
     small_model="$model"
   fi
@@ -4802,6 +5262,8 @@ run_claude_setup() {
     fi
   fi
 
+  record_model_history "$CLAUDE_MODEL_HISTORY" "$provider" "primary" "$model"
+  record_model_history "$CLAUDE_MODEL_HISTORY" "$provider" "small" "$small_model"
   write_switcher_command
 
   say

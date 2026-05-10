@@ -88,7 +88,8 @@ Choose upstream provider:
   2) DeepSeek V4
   3) Zhipu GLM
   4) Kimi
-  5) Custom OpenAI-compatible / vLLM
+  5) Xiaomi MiMo
+  6) Custom OpenAI-compatible / vLLM
 Provider choice [1]:
 ```
 
@@ -98,7 +99,8 @@ Type a number and press Enter:
 - DeepSeek V4: type `2`
 - Zhipu GLM: type `3`
 - Kimi: type `4`
-- Your own vLLM or another OpenAI-compatible service: type `5`
+- Xiaomi MiMo: type `5`
+- Your own vLLM or another OpenAI-compatible service: type `6`
 
 ### Enter Service URL
 
@@ -113,7 +115,7 @@ Endpoint choice [1]:
 
 For China mainland usage, press Enter. For the international endpoint, type `2`.
 
-DeepSeek V4, Zhipu GLM, and Kimi use built-in default endpoints, so you usually do not need to enter a URL manually.
+DeepSeek V4, Zhipu GLM, Kimi, and Xiaomi MiMo use built-in default endpoints, so you usually do not need to enter a URL manually. MiMo's landing page is `https://mimo.mi.com/`.
 
 Custom OpenAI-compatible / vLLM asks for an OpenAI-compatible base URL:
 
@@ -145,11 +147,12 @@ Choose Codex upstream provider:
   2) DeepSeek
   3) Zhipu GLM
   4) Kimi / Moonshot
-  5) Custom OpenAI-compatible / vLLM
+  5) Xiaomi MiMo
+  6) Custom OpenAI-compatible / vLLM
 Provider choice [1]:
 ```
 
-When you choose MiniMax, DeepSeek, Zhipu GLM, or Kimi, the script uses a built-in OpenAI-compatible URL and does not ask you to enter one. Only `Custom OpenAI-compatible / vLLM` asks for:
+When you choose MiniMax, DeepSeek, Zhipu GLM, Kimi, or Xiaomi MiMo, the script uses a built-in OpenAI-compatible URL and does not ask you to enter one. Only `Custom OpenAI-compatible / vLLM` asks for:
 
 ```text
 OpenAI-compatible base URL [http://127.0.0.1:8000/v1]:
@@ -159,17 +162,20 @@ After you enter the API key, the script calls `${base URL}/models` automatically
 
 ```text
 Checking models from http://113.249.108.72:15581/v1/models...
-Discovered models:
+Available models:
   1) Qwen/Qwen3.6-35B-A3B
   2) Custom model name
 Model choice [1]:
 ```
 
-Only if discovery fails does the installer ask for a model name manually:
+If discovery fails but you have configured models before, the installer shows the model history first. It only asks for a model name manually when there is no history:
 
 ```text
 Could not discover models from http://113.249.108.72:15581/v1/models.
-Model name:
+Previously configured models:
+  1) Qwen/Qwen3.6-35B-A3B
+  2) Custom model name
+Model choice [1]:
 ```
 
 Many domestic OpenAI-compatible endpoints still expose Chat Completions rather than Responses. The script automatically creates a separate local Codex Responses adapter:
@@ -197,18 +203,19 @@ Model choice [1]:
 ```
 
 Usually, press Enter to use the recommended model. To use another listed model, type its number. To enter a model name manually, choose the `Custom model name` number.
+Both Claude Code and Codex CLI remember models that were written successfully. Later switches merge those historical models with models discovered from the server, so you can select a model you used before.
 
 vLLM first tries to read the model list from the server:
 
 ```text
 Checking models from http://127.0.0.1:8000/v1/models...
-Discovered models:
+Available models:
   1) Qwen/Qwen3.6-35B-A3B
   2) Custom model name
 Model choice [1]:
 ```
 
-If the model is discovered, press Enter. If discovery fails, you will see:
+If a model is discovered or already exists in history, press Enter. If discovery fails and there is no history, you will see:
 
 ```text
 Could not discover models from http://127.0.0.1:8000/v1/models.
@@ -256,7 +263,7 @@ Mode [1]:
 
 Usually, press Enter to use `Direct mode`. Choose `2` only when you explicitly want Claude Code to go through a local proxy first.
 
-Zhipu GLM and Custom OpenAI-compatible / vLLM do not show this choice because they always need the local adapter proxy. You will see:
+Zhipu GLM, Xiaomi MiMo, and Custom OpenAI-compatible / vLLM do not show this choice because they always need the local adapter proxy. You will see:
 
 ```text
 Zhipu GLM uses an OpenAI-compatible API. Claude Code will use the local Anthropic adapter proxy.
@@ -271,7 +278,7 @@ This is the local proxy port used by Claude Code. It is not the upstream server 
 
 ### Start Local Proxy Service
 
-If you use Zhipu GLM, Custom OpenAI-compatible / vLLM, or choose local proxy mode, the script asks:
+If you use Zhipu GLM, Xiaomi MiMo, Custom OpenAI-compatible / vLLM, or choose local proxy mode, the script asks:
 
 ```text
 Start proxy as a systemd user service now? [Y/n]:
@@ -299,11 +306,12 @@ Claude Code:
 - DeepSeek V4
 - Zhipu GLM
 - Kimi
+- Xiaomi MiMo
 - Custom OpenAI-compatible / vLLM
 
 MiniMax, DeepSeek, and Kimi use Anthropic-compatible APIs. They can be used directly or through the local proxy.
 
-Zhipu GLM and Custom OpenAI-compatible / vLLM expose OpenAI-compatible `/chat/completions`, while Claude Code speaks the Anthropic Messages API. For that reason, they always use the local `agent-router-proxy` adapter.
+Zhipu GLM, Xiaomi MiMo, and Custom OpenAI-compatible / vLLM expose OpenAI-compatible `/chat/completions`, while Claude Code speaks the Anthropic Messages API. For that reason, they always use the local `agent-router-proxy` adapter.
 
 Codex CLI:
 
@@ -314,7 +322,7 @@ Codex CLI:
 
 vLLM needs a few extra notes:
 
-- Zhipu GLM and Custom OpenAI-compatible / vLLM always use local proxy mode because Claude Code's Anthropic Messages API must be adapted to an OpenAI-compatible API.
+- Zhipu GLM, Xiaomi MiMo, and Custom OpenAI-compatible / vLLM always use local proxy mode because Claude Code's Anthropic Messages API must be adapted to an OpenAI-compatible API.
 - If the Custom OpenAI-compatible / vLLM base URL is left empty, the default local URL is used:
 
 ```text
